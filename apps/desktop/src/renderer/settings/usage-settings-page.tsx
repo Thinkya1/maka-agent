@@ -1,7 +1,9 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import {
   Card,
   EmptyState,
+  FormLayout,
+  NumberInput,
   SegmentedControl,
   SegmentedControlItem,
   Tab,
@@ -15,6 +17,7 @@ import {
 import {
   uiLocaleToIntlLocale,
   type AppSettings,
+  type PricingConfig,
   type UpdateAppSettingsResult,
   type UsageRange,
   type UsageStats,
@@ -66,6 +69,30 @@ export function UsageSettingsPage(props: {
     (patch) => props.onUpdate({ usage: patch }).then((result) => result.settings.usage),
     { onError: (error) => toast.error(copy.saveFailed, settingsActionErrorMessage(error, locale)) },
   );
+  const [pricingOverrides, setPricingOverrides] = useState<PricingConfig[]>([]);
+  const [pricingLoading, setPricingLoading] = useState(true);
+  const pricingReloadTicketRef = useRef(0);
+
+  const reloadPricingOverrides = useCallback(async () => {
+    const ticket = pricingReloadTicketRef.current + 1;
+    pricingReloadTicketRef.current = ticket;
+    if (usagePageMountedRef.current) setPricingLoading(true);
+    try {
+      const result = await window.maka.settings.pricing.list();
+      if (!result.ok) throw new Error(result.error.message);
+      if (usagePageMountedRef.current && ticket === pricingReloadTicketRef.current) {
+        setPricingOverrides(result.data);
+      }
+    } catch (error) {
+      if (usagePageMountedRef.current && ticket === pricingReloadTicketRef.current) {
+        toast.error(copy.pricing.loadFailed, settingsActionErrorMessage(error, locale));
+      }
+    } finally {
+      if (usagePageMountedRef.current && ticket === pricingReloadTicketRef.current) {
+        setPricingLoading(false);
+      }
+    }
+  }, [copy.pricing.loadFailed, locale, toast, usagePageMountedRef]);
 
   const normalizedModelFilter = usageDraft.modelFilter.trim().toLowerCase();
   const hasRequestFilters = usageDraft.status !== 'all' || normalizedModelFilter.length > 0;
@@ -86,7 +113,7 @@ export function UsageSettingsPage(props: {
     providers: stats?.byProvider.length ?? 0,
     models: stats?.byModel.length ?? 0,
     tools: stats?.byTool.length ?? 0,
-    pricing: stats?.pricing.length ?? 0,
+    pricing: pricingOverrides.length,
   };
 
   async function setRange(range: UsageRange) {
@@ -114,6 +141,29 @@ export function UsageSettingsPage(props: {
 
   function clearRequestFilters() {
     void updateUsage({ status: 'all', modelFilter: '' });
+  }
+
+  useEffect(() => {
+    const unsubscribe = window.maka.settings.pricing.subscribeChanges(() => {
+      void reloadPricingOverrides();
+    });
+    void reloadPricingOverrides();
+    return unsubscribe;
+  }, [reloadPricingOverrides]);
+
+  async function putPricingOverride(pricing: PricingConfig) {
+    const result = await window.maka.settings.pricing.put(pricing);
+    if (!result.ok) throw new Error(result.error.message);
+    setPricingOverrides((current) => sortPricingOverrides([
+      ...current.filter((entry) => entry.modelKey !== result.data.modelKey),
+      result.data,
+    ]));
+  }
+
+  async function resetPricingOverride(modelKey: string) {
+    const result = await window.maka.settings.pricing.reset(modelKey);
+    if (!result.ok) throw new Error(result.error.message);
+    setPricingOverrides((current) => current.filter((entry) => entry.modelKey !== modelKey));
   }
 
   return (
@@ -215,7 +265,13 @@ export function UsageSettingsPage(props: {
 
         {usageDraft.activeTab === 'pricing' ? (
           <div className="settingsUsageTabPanel">
-            <UsagePricingPanel stats={stats} copy={copy} />
+            <UsagePricingPanel
+              pricing={pricingOverrides}
+              isLoading={pricingLoading}
+              copy={copy}
+              onPut={putPricingOverride}
+              onReset={resetPricingOverride}
+            />
           </div>
         ) : null}
       </div>
@@ -378,19 +434,272 @@ function UsageToolsPanel(props: { stats: UsageStats | null; copy: UsageSettingsC
   );
 }
 
-function UsagePricingPanel(props: { stats: UsageStats | null; copy: UsageSettingsCopy }) {
+interface PricingDraft {
+  originalModelKey: string | null;
+  modelKey: string;
+  inputUsdPer1M: number | null;
+  outputUsdPer1M: number | null;
+  cacheReadUsdPer1M: number | null;
+  cacheWriteUsdPer1M: number | null;
+}
+
+function emptyPricingDraft(): PricingDraft {
+  return {
+    originalModelKey: null,
+    modelKey: '',
+    inputUsdPer1M: null,
+    outputUsdPer1M: null,
+    cacheReadUsdPer1M: null,
+    cacheWriteUsdPer1M: null,
+  };
+}
+
+function pricingDraftFromConfig(pricing: PricingConfig): PricingDraft {
+  return {
+    originalModelKey: pricing.modelKey,
+    modelKey: pricing.modelKey,
+    inputUsdPer1M: pricing.inputUsdPer1M,
+    outputUsdPer1M: pricing.outputUsdPer1M,
+    cacheReadUsdPer1M: pricing.cacheReadUsdPer1M ?? null,
+    cacheWriteUsdPer1M: pricing.cacheWriteUsdPer1M ?? null,
+  };
+}
+
+function pricingConfigFromDraft(draft: PricingDraft): PricingConfig | null {
+  const modelKey = draft.modelKey.trim();
+  if (!modelKey || draft.inputUsdPer1M === null || draft.outputUsdPer1M === null) return null;
+  return {
+    modelKey,
+    inputUsdPer1M: draft.inputUsdPer1M,
+    outputUsdPer1M: draft.outputUsdPer1M,
+    ...(draft.cacheReadUsdPer1M === null ? {} : { cacheReadUsdPer1M: draft.cacheReadUsdPer1M }),
+    ...(draft.cacheWriteUsdPer1M === null ? {} : { cacheWriteUsdPer1M: draft.cacheWriteUsdPer1M }),
+  };
+}
+
+function splitPricingModelKey(modelKey: string): { provider: string; model: string } {
+  const separator = modelKey.indexOf(':');
+  if (separator <= 0) return { provider: '', model: modelKey };
+  return { provider: modelKey.slice(0, separator), model: modelKey.slice(separator + 1) };
+}
+
+function formatPricingRate(rate: number | undefined, empty: string): string {
+  return rate === undefined ? empty : `$${rate}`;
+}
+
+function sortPricingOverrides(pricing: PricingConfig[]): PricingConfig[] {
+  return pricing.sort((left, right) => left.modelKey.localeCompare(right.modelKey));
+}
+
+function UsagePricingPanel(props: {
+  pricing: PricingConfig[];
+  isLoading: boolean;
+  copy: UsageSettingsCopy;
+  onPut(pricing: PricingConfig): Promise<void>;
+  onReset(modelKey: string): Promise<void>;
+}) {
+  const locale = useUiLocale();
+  const toast = useToast();
+  const pricingActionGuard = useActionGuard<'put' | 'reset'>();
+  const [draft, setDraft] = useState<PricingDraft | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  function openAddForm() {
+    setFormError(null);
+    setDraft(emptyPricingDraft());
+  }
+
+  function openEditForm(pricing: PricingConfig) {
+    setFormError(null);
+    setDraft(pricingDraftFromConfig(pricing));
+  }
+
+  function closeForm() {
+    if (!busy) {
+      setDraft(null);
+      setFormError(null);
+    }
+  }
+
+  async function savePricing(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!draft || !pricingActionGuard.begin('put')) return;
+    const pricing = pricingConfigFromDraft(draft);
+    if (!pricing) {
+      setFormError(props.copy.pricing.invalid);
+      pricingActionGuard.finish();
+      return;
+    }
+    setBusy(true);
+    try {
+      await props.onPut(pricing);
+      if (draft) {
+        setDraft(null);
+        setFormError(null);
+      }
+      toast.success(props.copy.pricing.saved);
+    } catch (error) {
+      toast.error(props.copy.pricing.saveFailed, settingsActionErrorMessage(error, locale));
+    } finally {
+      pricingActionGuard.finish();
+      setBusy(false);
+    }
+  }
+
+  async function removePricing(modelKey: string) {
+    if (!pricingActionGuard.begin('reset')) return;
+    setBusy(true);
+    try {
+      const confirmed = await toast.confirm({
+        title: props.copy.pricing.removeTitle(modelKey),
+        description: props.copy.pricing.removeDescription,
+        confirmLabel: props.copy.pricing.remove,
+        cancelLabel: props.copy.pricing.cancel,
+        destructive: true,
+      });
+      if (!confirmed) return;
+      await props.onReset(modelKey);
+      if (draft?.originalModelKey === modelKey) {
+        setDraft(null);
+        setFormError(null);
+      }
+      toast.success(props.copy.pricing.removed);
+    } catch (error) {
+      toast.error(props.copy.pricing.deleteFailed, settingsActionErrorMessage(error, locale));
+    } finally {
+      pricingActionGuard.finish();
+      setBusy(false);
+    }
+  }
+
+  const controlsDisabled = busy || props.isLoading;
   return (
-    <UsageStatsTable
-      ariaLabel={props.copy.tables.pricingAria}
-      columns={[
-        { header: props.copy.tables.pricingHeaders[0], grow: true },
-        { header: props.copy.tables.pricingHeaders[1] },
-        { header: props.copy.tables.pricingHeaders[2], numeric: true },
-        { header: props.copy.tables.pricingHeaders[3], numeric: true },
-      ]}
-      rows={(props.stats?.pricing ?? []).map((row) => [row.provider, row.model, `$${row.inputPerMTokUsd}`, `$${row.outputPerMTokUsd}`])}
-      empty={{ Icon: BarChart3, title: props.copy.tables.noPricing, body: props.copy.tables.pricingEmptyBody }}
-    />
+    <>
+      <div className="settingsUsagePricingHeader">
+        <div>
+          <strong>{props.copy.pricing.title}</strong>
+          <small>{props.copy.pricing.description}</small>
+        </div>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          isDisabled={controlsDisabled}
+          onClick={openAddForm}
+          label={props.copy.pricing.add}
+        />
+      </div>
+
+      {draft ? (
+        <form
+          className="settingsUsagePricingForm"
+          aria-label={props.copy.pricing.formAria}
+          aria-busy={busy}
+          onSubmit={(event) => void savePricing(event)}
+        >
+          <FormLayout>
+            <TextInput
+              value={draft.modelKey}
+              onChange={(modelKey) => setDraft((current) => current ? { ...current, modelKey } : current)}
+              placeholder={props.copy.pricing.modelKeyPlaceholder}
+              label={props.copy.pricing.modelKey}
+              isRequired
+              isDisabled={busy || draft.originalModelKey !== null}
+              width="100%"
+            />
+            <div className="settingsUsagePricingRateFields">
+              <NumberInput
+                label={props.copy.pricing.inputRate}
+                value={draft.inputUsdPer1M}
+                min={0}
+                step={0.000001}
+                hasClear
+                isRequired
+                isDisabled={busy}
+                onChange={(inputUsdPer1M) => setDraft((current) => current ? { ...current, inputUsdPer1M } : current)}
+              />
+              <NumberInput
+                label={props.copy.pricing.outputRate}
+                value={draft.outputUsdPer1M}
+                min={0}
+                step={0.000001}
+                hasClear
+                isRequired
+                isDisabled={busy}
+                onChange={(outputUsdPer1M) => setDraft((current) => current ? { ...current, outputUsdPer1M } : current)}
+              />
+              <NumberInput
+                label={props.copy.pricing.cacheReadRate}
+                value={draft.cacheReadUsdPer1M}
+                min={0}
+                step={0.000001}
+                hasClear
+                isOptional
+                isDisabled={busy}
+                onChange={(cacheReadUsdPer1M) => setDraft((current) => current ? { ...current, cacheReadUsdPer1M } : current)}
+              />
+              <NumberInput
+                label={props.copy.pricing.cacheWriteRate}
+                value={draft.cacheWriteUsdPer1M}
+                min={0}
+                step={0.000001}
+                hasClear
+                isOptional
+                isDisabled={busy}
+                onChange={(cacheWriteUsdPer1M) => setDraft((current) => current ? { ...current, cacheWriteUsdPer1M } : current)}
+              />
+            </div>
+          </FormLayout>
+          {formError ? <p className="settingsUsagePricingError" role="alert">{formError}</p> : null}
+          <div className="settingsUsagePricingFormActions">
+            <Button type="button" variant="ghost" size="sm" isDisabled={busy} onClick={closeForm} label={props.copy.pricing.cancel} />
+            <Button
+              type="submit"
+              variant="primary"
+              size="sm"
+              isDisabled={busy}
+              aria-busy={busy}
+              data-pending={busy ? 'true' : undefined}
+              label={busy ? props.copy.pricing.saving : props.copy.pricing.save}
+            />
+          </div>
+        </form>
+      ) : null}
+
+      {props.isLoading && props.pricing.length === 0 ? (
+        <p className="settingsUsagePricingLoading" role="status">{props.copy.pricing.loading}</p>
+      ) : (
+        <UsageStatsTable
+          ariaLabel={props.copy.tables.pricingAria}
+          columns={[
+            { header: props.copy.tables.pricingHeaders[0], grow: true },
+            { header: props.copy.tables.pricingHeaders[1], grow: true },
+            { header: props.copy.tables.pricingHeaders[2], numeric: true },
+            { header: props.copy.tables.pricingHeaders[3], numeric: true },
+            { header: props.copy.tables.pricingHeaders[4], numeric: true },
+            { header: props.copy.tables.pricingHeaders[5], numeric: true },
+            { header: props.copy.tables.pricingHeaders[6] },
+          ]}
+          rows={props.pricing.map((pricing) => {
+            const { provider, model } = splitPricingModelKey(pricing.modelKey);
+            return [
+              provider || '—',
+              model,
+              formatPricingRate(pricing.inputUsdPer1M, props.copy.pricing.noCache),
+              formatPricingRate(pricing.outputUsdPer1M, props.copy.pricing.noCache),
+              formatPricingRate(pricing.cacheReadUsdPer1M, props.copy.pricing.noCache),
+              formatPricingRate(pricing.cacheWriteUsdPer1M, props.copy.pricing.noCache),
+              <span className="settingsUsagePricingRowActions" role="group" aria-label={props.copy.pricing.actionsAria}>
+                <Button type="button" variant="ghost" size="sm" isDisabled={controlsDisabled} onClick={() => openEditForm(pricing)} label={props.copy.pricing.edit} />
+                <Button type="button" variant="ghost" size="sm" isDisabled={controlsDisabled} onClick={() => void removePricing(pricing.modelKey)} label={busy ? props.copy.pricing.removing : props.copy.pricing.remove} />
+              </span>,
+            ];
+          })}
+          empty={{ Icon: BarChart3, title: props.copy.tables.noPricing, body: props.copy.tables.pricingEmptyBody }}
+        />
+      )}
+    </>
   );
 }
 
