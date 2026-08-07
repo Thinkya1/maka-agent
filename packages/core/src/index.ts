@@ -1585,6 +1585,8 @@ export {
 // model-metadata.ts
 export {
   modelMetadataIdsForProvider,
+  resolveModelInputModalities,
+  resolveModelPdfSupport,
   resolveModelVisionSupport,
   resolveModelVoiceMetadata,
 } from './model-metadata.js';

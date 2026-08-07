@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildModelPickerDescriptions,
   buildModelPickerOptions,
   buildModelPickerProviderTypes,
 } from '../model-picker-internals.js';
@@ -115,6 +116,30 @@ describe('ModelPicker option shaping', () => {
         ['openai-main:gpt-5', 'openai'],
         ['openai-main:o3-mini', 'openai'],
       ],
+    );
+  });
+
+  it('maps model facts to localized option descriptions', () => {
+    const describedGroups: ModelMenuGroup[] = [
+      {
+        ...groups[0],
+        choices: [
+          {
+            ...groups[0].choices[0],
+            description: 'Balanced Claude model',
+            knowledgeCutoff: '2025-07-31',
+          },
+        ],
+      },
+    ];
+
+    assert.deepEqual(
+      [...buildModelPickerDescriptions(describedGroups, 'zh')],
+      [['anthropic-team:claude-sonnet-4', 'Balanced Claude model · 知识截止：2025-07-31']],
+    );
+    assert.deepEqual(
+      [...buildModelPickerDescriptions(describedGroups, 'en')],
+      [['anthropic-team:claude-sonnet-4', 'Balanced Claude model · Knowledge cutoff: 2025-07-31']],
     );
   });
 });

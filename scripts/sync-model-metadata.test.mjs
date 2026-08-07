@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { toMetadata, PROVIDERS } from './sync-model-metadata.mjs';
+import { toMetadata, toPricing, PROVIDERS } from './sync-model-metadata.mjs';
 
 const PROVIDER = { doc: 'https://example.com/docs' };
 const BASE_MODEL = {
@@ -17,6 +17,56 @@ test('models.dev reasoning_options effort values pass through to thinkingOptions
     reasoning_options: [{ type: 'effort', values: ['high', 'max'] }],
   });
   assert.deepEqual(metadata.thinkingOptions, { efforts: ['high', 'max'] });
+});
+
+test('models.dev facts preserve the extended metadata contract', () => {
+  const metadata = toMetadata('test', 'm', PROVIDER, {
+    ...BASE_MODEL,
+    description: 'A useful model',
+    knowledge: '2025-12-01',
+    last_updated: '2026-01-02',
+    structured_output: false,
+    status: 'beta',
+    limit: { context: 128_000, input: 96_000, output: 8_192 },
+    modalities: { input: ['text', 'image', 'pdf', 'video'], output: ['text'] },
+  });
+  assert.equal(metadata.description, 'A useful model');
+  assert.equal(metadata.knowledgeCutoff, '2025-12-01');
+  assert.equal(metadata.inputLimit, 96_000);
+  assert.equal(metadata.structuredOutput, false);
+  assert.equal(metadata.lastUpdated, '2026-01-02');
+  assert.equal(metadata.lifecycle, 'beta');
+  assert.deepEqual(metadata.modalities, { input: ['text', 'image', 'pdf'], output: ['text'] });
+
+  assert.equal(
+    toMetadata('test', 'alpha-model', PROVIDER, {
+      ...BASE_MODEL,
+      status: 'alpha',
+    }).lifecycle,
+    'alpha',
+  );
+});
+
+test('models.dev pricing keeps base rates and ignores tiered rates', () => {
+  assert.deepEqual(
+    toPricing('openai', 'gpt-test', {
+      cost: {
+        input: 3,
+        output: 15,
+        cache_read: 0.3,
+        cache_write: 3.75,
+        context_over_200k: { input: 6, output: 30 },
+        tiers: [{ input: 6, output: 30 }],
+      },
+    }),
+    {
+      modelKey: 'openai:gpt-test',
+      inputUsdPer1M: 3,
+      outputUsdPer1M: 15,
+      cacheReadUsdPer1M: 0.3,
+      cacheWriteUsdPer1M: 3.75,
+    },
+  );
 });
 
 test('models.dev reasoning_options toggle passes through to thinkingOptions', () => {
@@ -99,6 +149,7 @@ test('main() syncs only the mapped providers into the generated snapshot', async
     limit: { context: 1_048_576, output: 131_072 },
     reasoning: true,
     tool_call: true,
+    cost: { input: 1, output: 2 },
     reasoning_options: [{ type: 'toggle' }, { type: 'effort', values: ['low', 'high', 'max'] }],
   };
   catalog['unmapped-provider'] = {
@@ -121,10 +172,12 @@ test('main() syncs only the mapped providers into the generated snapshot', async
   const dir = await mkdtemp(join(tmpdir(), 'maka-sync-'));
   const input = join(dir, 'catalog.json');
   const output = join(dir, 'out.ts');
+  const pricingOutput = join(dir, 'pricing.ts');
   await writeFile(input, JSON.stringify(catalog));
   const { main } = await import('./sync-model-metadata.mjs');
-  await main(['--input', input, '--output', output]);
+  await main(['--input', input, '--output', output, '--pricing-output', pricingOutput]);
   const out = await readFile(output, 'utf8');
+  const pricing = await readFile(pricingOutput, 'utf8');
   await rm(dir, { recursive: true, force: true });
 
   assert.match(out, /"kimi-coding-plan": \{/);
@@ -132,6 +185,7 @@ test('main() syncs only the mapped providers into the generated snapshot', async
   assert.match(out, /"thinkingOptions":\{"efforts":\["low","high","max"\],"toggle":true\}/);
   assert.match(out, /"kimi-for-coding": \{/);
   assert.match(out, /"kimi-for-coding": \{"api":"https:\/\/api\.kimi\.com\/coding\/v1"\}/);
+  assert.match(pricing, /"modelKey":"kimi-coding-plan:k3","inputUsdPer1M":1,"outputUsdPer1M":2/);
   // The unmapped provider must appear only in the directory (the complete
   // upstream catalog), never as a snapshot segment or provider fact.
   const directoryStart = out.indexOf('GENERATED_MODELS_DEV_DIRECTORY');

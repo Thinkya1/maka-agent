@@ -416,12 +416,19 @@ export function resolveSelectedModelContextWindow(
   const model = selectedModelId
     ? connection.models?.find((candidate) => candidate.id === selectedModelId)
     : undefined;
+  const metadata = selectedModelId
+    ? lookupModelMetadata(connection.providerType, selectedModelId)
+    : undefined;
   return (
+    positiveInputLimit(model?.inputLimit) ??
+    positiveInputLimit(metadata?.inputLimit) ??
     model?.contextWindow ??
-    (selectedModelId
-      ? lookupModelMetadata(connection.providerType, selectedModelId).contextWindow
-      : undefined)
+    metadata?.contextWindow
   );
+}
+
+function positiveInputLimit(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 export interface ContextBudgetCapacity {

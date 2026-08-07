@@ -64,7 +64,7 @@ export interface VoiceModelRouteCapability {
   modelId: string;
   providerLabel?: string;
   modalities: {
-    input: Array<'text' | 'image' | 'audio'>;
+    input: Array<'text' | 'image' | 'audio' | 'pdf'>;
     output: Array<'text' | 'image' | 'audio'>;
   };
   endpointRoles: Array<
