@@ -49,7 +49,6 @@ import type {
   UpdateAppSettingsResult,
   UsageRange,
   UsageStats,
-  PricingConfig,
   E2eFixtureState,
   ArtifactBinaryReadResult,
   ArtifactChangedEvent,
@@ -829,22 +828,6 @@ const makaBridge = {
     },
     usageStats(range?: UsageRange): Promise<UsageStats> {
       return ipcRenderer.invoke('settings:usageStats', range);
-    },
-    pricing: {
-      list(): Promise<Result<PricingConfig[]>> {
-        return ipcRenderer.invoke('usage:pricing:list');
-      },
-      put(pricing: PricingConfig): Promise<Result<PricingConfig>> {
-        return ipcRenderer.invoke('usage:pricing:put', pricing);
-      },
-      reset(modelKey: string): Promise<Result<void>> {
-        return ipcRenderer.invoke('usage:pricing:reset', modelKey);
-      },
-      subscribeChanges(handler: () => void): () => void {
-        const listener = () => handler();
-        ipcRenderer.on('usage:pricing:changed', listener);
-        return () => ipcRenderer.off('usage:pricing:changed', listener);
-      },
     },
     bots: {
       listStatuses(): Promise<Record<BotProvider, BotStatus>> {

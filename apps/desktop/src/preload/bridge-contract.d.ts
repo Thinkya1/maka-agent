@@ -36,7 +36,6 @@ import type {
   UpdateAppSettingsResult,
   UsageRange,
   UsageStats,
-  PricingConfig,
   E2eFixtureState,
   ArtifactBinaryReadResult,
   ArtifactChangedEvent,
@@ -370,12 +369,6 @@ export interface MakaBridge {
     testNetworkProxy(input?: TestProxyInput): Promise<SettingsTestResult>;
     testBotChannel(provider: BotProvider): Promise<SettingsTestResult>;
     usageStats(range?: UsageRange): Promise<UsageStats>;
-    pricing: {
-      list(): Promise<Result<PricingConfig[]>>;
-      put(pricing: PricingConfig): Promise<Result<PricingConfig>>;
-      reset(modelKey: string): Promise<Result<void>>;
-      subscribeChanges(handler: () => void): () => void;
-    };
     bots: {
       listStatuses(): Promise<Record<BotProvider, BotStatus>>;
       restart(provider: BotProvider): Promise<BotStatus>;

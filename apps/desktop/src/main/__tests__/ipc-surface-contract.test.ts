@@ -27,13 +27,16 @@ function extractChannels(source: string, pattern: RegExp): Set<string> {
 }
 
 // Channels deliberately registered in main with no preload consumer.
-// Usage summary/buckets/logs remain main-side projections. Pricing mutations
-// are exposed through the narrow settings.pricing bridge because the pricing
-// panel is a real renderer consumer.
+// usage:* is the #1596 Usage/Pricing authority surface: per the #1982
+// decision it stays main-side until the #2010 M4 client adapter exposes a
+// narrow renderer interface (pricing.query / pricing.mutate).
 const MAIN_ONLY_CHANNELS = [
   'usage:summary',
   'usage:buckets',
   'usage:logs',
+  'usage:pricing:list',
+  'usage:pricing:put',
+  'usage:pricing:reset',
 ];
 
 describe('IPC surface contract', () => {
