@@ -22,16 +22,31 @@ import type { StatusDotVariant } from '@astryxdesign/core/StatusDot';
  * `active` respectively, and the disagreement is visible in the call site
  * rather than hidden in a shared name.
  */
+/**
+ * Choosing between these turns on two questions, in order:
+ *
+ *   1. Is something happening, and if so who is doing it? The SYSTEM working
+ *      is `active`; waiting on the USER is `attention`. Collapsing those two
+ *      is the mistake that produced this vocabulary's worst case — an expired
+ *      credential reported as "in progress" when nothing is progressing.
+ *   2. If nothing is happening, is this a verified good outcome (`success`), a
+ *      broken one (`error`), or simply a fact (`neutral`)?
+ *
+ * `success` is reserved for a health that was PROVEN — a connection test that
+ * passed, a credential that validated. A switch merely being on is not proof
+ * of anything and reads as `active` (participating) or `neutral` (present),
+ * which is why an enabled skill is not green.
+ */
 export type StatusSemantic =
-  /** Healthy, connected, finished well. */
+  /** Proven healthy: a test passed, a credential validated, a server answered. */
   | 'success'
-  /** Live right now — running, scheduled, in flight. */
+  /** The system is working on it right now — running, authorizing, in flight. */
   | 'active'
-  /** Needs a human eventually: paused, shadowed, degraded, review pending. */
+  /** Waiting on a person: re-auth needed, review pending, paused, untested. */
   | 'attention'
   /** Broken now: failed delivery, invalid metadata, unreachable server. */
   | 'error'
-  /** Present but not participating: disabled, completed-and-spent, off. */
+  /** A settled fact, nothing to do: disabled, configured, completed-and-spent. */
   | 'neutral';
 
 /**
@@ -51,20 +66,17 @@ const SEMANTIC_TO_DOT: Record<StatusSemantic, StatusDotVariant> = {
 };
 
 /**
- * Named `dotForStatus` rather than `statusDotVariant` only to avoid colliding
- * with the settings surface's own `statusDotVariant`
- * (`settings-status-badge.ts`), which nine files still import.
+ * Every status dot in the app now comes through here.
  *
- * That file is the eighth mapper and the largest — it predates this one and
- * carries the settings surface's whole status language. The end state is that
- * it becomes another adapter onto this vocabulary rather than a parallel
- * system, at which point these two names collapse into one. It is not migrated
- * here because its `info` states need a per-surface semantic decision (nine of
- * them: does this mean "do not draw the eye" or "something is live?"), which is
- * a design call and deserves its own pass rather than being guessed mid-refactor.
+ * The name was chosen to avoid colliding with the settings surface's own
+ * `statusDotVariant` while both existed; that one is gone, so the collision is
+ * too. Kept as `dotForStatus` because it reads as what it does and renaming it
+ * back would churn a dozen call sites for nothing.
  *
- * Until then: new code uses this vocabulary; the settings surface keeps its
- * own; neither grows a second opinion about what a state colour means.
+ * `StatusTone` still exists next to it, and deliberately: Astryx's Badge has an
+ * `info` pill and its own `neutral`, so a Badge can express a shade a dot
+ * cannot. One surface still renders those. Two vocabularies, because there are
+ * genuinely two — not because nobody cleaned up.
  */
 export function dotForStatus(semantic: StatusSemantic): StatusDotVariant {
   return SEMANTIC_TO_DOT[semantic];

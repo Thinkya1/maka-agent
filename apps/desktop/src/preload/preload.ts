@@ -6,10 +6,13 @@ import type {
   PermissionActionResult,
   PermissionOverlayStartResult,
   RendererIngestInput,
+  DesktopBranchFromTurnInput,
+  DesktopReviseBeforeTurnInput,
   AppUpdateInstallRequest,
   AppUpdateInstallResult,
   AppUpdateStatus,
   WindowCommand,
+  PetPackChangedEvent,
 } from './bridge-contract.js';
 import type {
   ConnectionEvent,
@@ -55,10 +58,8 @@ import type {
   ArtifactDescriptor,
   ArtifactSaveResult,
   ArtifactTextReadResult,
-  BranchFromTurnInput,
   CapabilitySnapshotCollection,
   RegenerateTurnInput,
-  ReviseBeforeTurnInput,
   TurnRecord,
   PermissionSnapshot,
   LocalMemoryEntryPreview,
@@ -73,12 +74,6 @@ import type {
   DailyReviewArchive,
   DailyReviewArchiveSummary,
   QueueEnqueueOutcome,
-  VoiceBeginRequest,
-  VoiceBeginResult,
-  VoiceCapturedAudio,
-  VoiceCoordinatorToolCall,
-  VoiceFinishCaptureResult,
-  VoiceRealtimeClientSession,
   DailyReviewConfig,
   DailyReviewRange,
   DailyReviewSummary,
@@ -125,6 +120,32 @@ type LocalMemoryMutationResult =
   | { ok: false; state: LocalMemoryState; reason: string; message: string };
 
 const makaBridge = {
+  pets: {
+    list() {
+      return ipcRenderer.invoke('pets:list');
+    },
+    getSelection() {
+      return ipcRenderer.invoke('pets:getSelection');
+    },
+    select(petId: string | null) {
+      return ipcRenderer.invoke('pets:select', petId);
+    },
+    readSpriteSheet(petId: string) {
+      return ipcRenderer.invoke('pets:readSpriteSheet', petId);
+    },
+    remove(petId: string) {
+      return ipcRenderer.invoke('pets:remove', petId);
+    },
+    importLocalDirectory() {
+      return ipcRenderer.invoke('pets:importLocalDirectory');
+    },
+    subscribeChanges(handler: (event: PetPackChangedEvent) => void): () => void {
+      const listener = (_event: Electron.IpcRendererEvent, payload: PetPackChangedEvent) =>
+        handler(payload);
+      ipcRenderer.on('pets:changed', listener);
+      return () => ipcRenderer.off('pets:changed', listener);
+    },
+  },
   tasks: {
     list(sessionId: string): Promise<Task[]> {
       return ipcRenderer.invoke('tasks:list', sessionId);
@@ -198,7 +219,6 @@ const makaBridge = {
             turnId: string;
             text: string;
             displayText?: string;
-            voiceOperationId?: string;
             skillIds?: string[];
             attachmentItems?: RendererIngestInput[];
             turnOrchestration?: TurnOrchestration;
@@ -255,10 +275,10 @@ const makaBridge = {
     regenerateTurn(sessionId: string, input: RegenerateTurnInput): Promise<void> {
       return ipcRenderer.invoke('sessions:regenerateTurn', sessionId, input);
     },
-    branchFromTurn(sessionId: string, input: BranchFromTurnInput): Promise<SessionSummary> {
+    branchFromTurn(sessionId: string, input: DesktopBranchFromTurnInput): Promise<SessionSummary> {
       return ipcRenderer.invoke('sessions:branchFromTurn', sessionId, input);
     },
-    reviseBeforeTurn(sessionId: string, input: ReviseBeforeTurnInput): Promise<SessionSummary> {
+    reviseBeforeTurn(sessionId: string, input: DesktopReviseBeforeTurnInput): Promise<SessionSummary> {
       return ipcRenderer.invoke('sessions:reviseBeforeTurn', sessionId, input);
     },
     respondToSandboxBoundary(sessionId: string, response: SandboxBoundaryResponse): Promise<void> {
@@ -364,8 +384,11 @@ const makaBridge = {
     remove(sessionId: string, options?: { revisionFamily?: boolean }): Promise<void> {
       return ipcRenderer.invoke('sessions:remove', sessionId, options);
     },
-    cleanupQuoteCompanion(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('sessions:cleanupQuoteCompanion', sessionId);
+    cleanupSessionCopy(sessionId: string): Promise<void> {
+      return ipcRenderer.invoke('sessions:cleanupSessionCopy', sessionId);
+    },
+    abandonSessionCopy(sessionId: string): Promise<void> {
+      return ipcRenderer.invoke('sessions:abandonSessionCopy', sessionId);
     },
   },
   projects: {
@@ -866,29 +889,6 @@ const makaBridge = {
           return ipcRenderer.invoke('settings:bots:onboarding:open', sessionId);
         },
       },
-    },
-  },
-  voice: {
-    begin(input: VoiceBeginRequest): Promise<VoiceBeginResult> {
-      return ipcRenderer.invoke('voice:begin', input);
-    },
-    finishCapture(
-      operationId: string,
-      audio: VoiceCapturedAudio,
-    ): Promise<VoiceFinishCaptureResult> {
-      return ipcRenderer.invoke('voice:finishCapture', operationId, audio);
-    },
-    cancel(operationId: string): Promise<void> {
-      return ipcRenderer.invoke('voice:cancel', operationId);
-    },
-    createRealtimeSession(offerSdp: string): Promise<VoiceRealtimeClientSession> {
-      return ipcRenderer.invoke('voice:createRealtimeSession', offerSdp);
-    },
-    closeRealtimeSession(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('voice:closeRealtimeSession', sessionId);
-    },
-    validateCoordinatorToolCall(input: unknown): Promise<VoiceCoordinatorToolCall> {
-      return ipcRenderer.invoke('voice:validateCoordinatorToolCall', input);
     },
   },
   notifications: {

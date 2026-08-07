@@ -9,7 +9,6 @@ import {
   isThinkingLevel,
   sanitizeTaskLedgerTask,
   thinkingVariantsForModel,
-  VOICE_INPUT_MARKER,
 } from '@maka/core';
 import type {
   CreateSessionRequestInput,
@@ -20,7 +19,6 @@ import type {
   SessionListFilter,
   StoredMessage,
   ThinkingLevel,
-  EphemeralVoiceAudio,
 } from '@maka/core';
 import type { ProviderType } from '@maka/core/llm-connections';
 import type { WorkspacePrivacyContext } from '@maka/core/incognito';
@@ -57,7 +55,7 @@ import { handleReviseBeforeTurn } from './session-revision.js';
 import { prepareSessionSendSkillPlan } from './session-send-skill-plan.js';
 import type { DesktopCreateSessionInput } from './new-session-project.js';
 import { registerSessionExecutionIpc } from './session-execution-ipc-main.js';
-import { createQuoteCompanionCleanupAuthority } from './quote-companion-cleanup.js';
+import { createSessionCopyCleanupAuthority } from './quote-companion-cleanup.js';
 import { mergeSentInlineReferences } from './session-send-inline-references.js';
 import { resolveSessionActionIds } from './session-family-action.js';
 import { normalizeSessionModelSelection } from './session-model-input.js';
@@ -144,11 +142,6 @@ export interface SessionsIpcDeps {
   ) => Promise<{ turnId: string; ok: boolean; error?: string }>;
   getWorkspacePrivacyContext: () => Promise<WorkspacePrivacyContext>;
   canCreateFakeSession: () => boolean;
-  consumeNativeAudioOperation?: (input: {
-    operationId: string;
-    connectionSlug: string;
-    model: string;
-  }) => EphemeralVoiceAudio;
 }
 
 function latestStoredMessageTs(messages: readonly StoredMessage[]): number | undefined {
@@ -210,7 +203,6 @@ export function registerSessionsIpc(
     streamEvents,
     getWorkspacePrivacyContext,
     canCreateFakeSession,
-    consumeNativeAudioOperation,
   } = deps;
   registerSessionExecutionIpc({
     ipcMain,
@@ -234,7 +226,7 @@ export function registerSessionsIpc(
     automationManager.removeAllForSession(sessionId);
     emitSessionsChanged('deleted', sessionId);
   };
-  const quoteCompanionCleanup = createQuoteCompanionCleanupAuthority({
+  const sessionCopyCleanup = createSessionCopyCleanupAuthority({
     workspaceRoot,
     removeSession,
   });
@@ -252,7 +244,7 @@ export function registerSessionsIpc(
   ipcMain.handle('sessions:list', async (_event, filter?: SessionListFilter) => {
     // Listing is also a recovery trigger. Await it so an orphaned hidden
     // companion is removed before it can reappear in the sidebar after restart.
-    const recovery = await quoteCompanionCleanup.recover();
+    const recovery = await sessionCopyCleanup.recover();
     const pendingCleanup = new Set(recovery.failed.map(({ sessionId }) => sessionId));
     return (await runtime.listSessions(filter)).filter(
       ({ id }) => !pendingCleanup.has(id),
@@ -486,27 +478,11 @@ export function registerSessionsIpc(
       workspaceFileReferences: sendCommand.workspaceFileReferences,
       receipts: skillInvocation.skillInvocation.receipts,
     });
-    const voiceTargetHeader = sendCommand.voiceOperationId
-      ? await store.readHeader(sessionId)
-      : undefined;
-    const voiceAudio =
-      sendCommand.voiceOperationId && voiceTargetHeader
-        ? consumeNativeAudioOperation?.({
-            operationId: sendCommand.voiceOperationId,
-            connectionSlug: voiceTargetHeader.llmConnectionSlug,
-            model: voiceTargetHeader.model,
-          })
-        : undefined;
-    if (sendCommand.voiceOperationId && !voiceAudio) {
-      throw new Error('voice_operation_unavailable');
-    }
     const iterator = runtime.sendMessage(
       sessionId,
       {
         turnId,
-        text:
-          skillInvocation.sendText || (sendCommand.voiceOperationId ? VOICE_INPUT_MARKER : ''),
-        ...(voiceAudio ? { voiceAudio } : {}),
+        text: skillInvocation.sendText,
         ...(skillInvocation.disposition === 'ready' || sendCommand.displayText !== undefined
           ? { displayText }
           : {}),
@@ -742,8 +718,13 @@ export function registerSessionsIpc(
       await removeSession(id);
     }
   });
-  ipcMain.handle('sessions:cleanupQuoteCompanion', async (_event, sessionId: string) => {
-    await quoteCompanionCleanup.cleanup(sessionId);
+  ipcMain.handle('sessions:cleanupSessionCopy', async (_event, sessionId: string) => {
+    if (!(await runtime.listSessions()).some((session) => session.id === sessionId)) return;
+    await sessionCopyCleanup.cleanup(sessionId);
+  });
+  ipcMain.handle('sessions:abandonSessionCopy', async (_event, sessionId: string) => {
+    if (!(await runtime.listSessions()).some((session) => session.id === sessionId)) return;
+    await sessionCopyCleanup.schedule(sessionId);
   });
 }
 

@@ -16,14 +16,12 @@ import {
   ArrowUp,
   FileText,
   ListTodo,
-  Mic,
   Network,
   Pencil,
   Plus,
   Sparkles,
   Upload,
   Workflow,
-  X,
 } from './icons.js';
 import {
   ChatModelSwitcher,
@@ -58,8 +56,9 @@ import {
   ChatComposerDrawer,
   ChatComposerInput,
   IconButton,
-  Thumbnail,
+  Lightbox,
   Token,
+  Tooltip,
   useChatPasteAsToken,
   type ChatComposerInputHandle,
   type ChatComposerToken,
@@ -206,8 +205,9 @@ export const Composer = forwardRef<
       mimeType?: string;
       size: number;
       /** Renderer-resolvable image source (object/data URL) for `kind: 'image'`
-       *  previews. While absent (still loading, or preview failed) the image
-       *  renders as a named file card instead of a thumbnail. */
+       *  previews. When set, the chip is clickable and opens the image in a
+       *  Lightbox; while absent (still loading, or preview failed) the chip is
+       *  inert like any other kind. */
       previewUrl?: string;
     }[];
     onRemoveAttachment?(index: number): void;
@@ -311,19 +311,6 @@ export const Composer = forwardRef<
     graphModePending?: boolean;
     graphModeDisabledReason?: string;
     onGraphModeChange?(active: boolean): void | Promise<void>;
-    voiceCaptureState?: 'idle' | 'requesting' | 'recording' | 'processing' | 'native_ready' | 'sending';
-    /** @deprecated Quiet composer drops realtime chrome; retained for host compatibility. */
-    realtimeVoiceState?: 'idle' | 'connecting' | 'connected';
-    voiceProviderLabel?: string;
-    /**
-     * When provided (and the host has recognition configured), a single mic
-     * appears left of Send. Omitted by default so unconfigured voice is not a
-     * dead control.
-     */
-    onToggleVoiceCapture?(input?: { dictate?: boolean }): void | Promise<void>;
-    onCancelVoiceCapture?(): void;
-    /** @deprecated Realtime voice is not rendered in the quiet composer. */
-    onToggleRealtimeVoice?(): void | Promise<void>;
     /**
      * Composer mention popups. Both are optional and the whole feature no-ops
      * when absent (SSR contracts render Composer with minimal props):
@@ -588,11 +575,6 @@ export const Composer = forwardRef<
   const locale = useUiLocale();
   const copy = getConversationCopy(locale).composer;
   const mentionCopy = getConversationCopy(locale).mentions;
-  const voiceCaptureLabel = props.voiceCaptureState === 'recording'
-    ? copy.voiceStopRecording
-    : props.voiceCaptureState === 'native_ready'
-      ? copy.voiceSend
-      : copy.voiceStart;
 
   useEffect(() => {
     return () => {
@@ -979,15 +961,6 @@ export const Composer = forwardRef<
       );
       return;
     }
-    if (
-      event.key === 'Escape' &&
-      props.voiceCaptureState &&
-      props.voiceCaptureState !== 'idle'
-    ) {
-      event.preventDefault();
-      props.onCancelVoiceCapture?.();
-      return;
-    }
     // Esc while a drag-active highlight is showing should clear it
     // immediately. The existing useEffect listens for blur/dragend/drop
     // but not keydown, so a user who hits Esc to cancel a stuck drag
@@ -1131,6 +1104,24 @@ export const Composer = forwardRef<
    */
   const drawerTokenCount =
     (props.pendingQuotes?.length ?? 0) + (props.pendingAttachments?.length ?? 0);
+  /** The last staged image opened from a chip (Lightbox media shape). Kept
+   *  mounted after close — see the Lightbox render — so only the open flag
+   *  drives visibility. */
+  const [attachmentLightbox, setAttachmentLightbox] = useState<{
+    src: string;
+    alt: string;
+    caption: string;
+  } | null>(null);
+  const [attachmentLightboxOpen, setAttachmentLightboxOpen] = useState(false);
+  useEffect(() => {
+    if (attachmentLightboxOpen || !attachmentLightbox) return;
+    // Unmount one commit AFTER the closed render, never in it: child effects
+    // run first, so Astryx has already executed dialog.close() — the native
+    // hand-back of focus to the chip button — by the time this fires. The
+    // deferred unmount also keeps the DOM to a single .astryx-lightbox for
+    // the chat transcript's own lightbox.
+    setAttachmentLightbox(null);
+  }, [attachmentLightboxOpen, attachmentLightbox]);
   /**
    * The session modes that are currently on, in the order the ＋ menu lists
    * them. The menu stays the switch — it turns each mode on *and* off; these
@@ -1201,7 +1192,6 @@ export const Composer = forwardRef<
     || props.onSwarmModeChange
     || props.onGraphModeChange,
   );
-  const showVoiceCapture = Boolean(props.onToggleVoiceCapture) && !props.streaming;
 
   return (
     <>
@@ -1313,57 +1303,53 @@ export const Composer = forwardRef<
                   const onRemove = props.onRemoveAttachment
                     ? () => props.onRemoveAttachment?.(index)
                     : undefined;
-                  // Astryx-standard rendering (per maintainer guidance): images
-                  // with a resolved preview get a real Thumbnail; everything
-                  // else — other kinds, AND images whose preview failed or is
-                  // still loading — gets the two-line file card, so nothing
-                  // ever sits in the drawer as an anonymous placeholder square.
-                  if (attachment.kind === 'image' && attachment.previewUrl) {
-                    return (
-                      <Thumbnail
-                        key={`${attachment.displayName}-${index}`}
-                        className="maka-composer-attachment-thumbnail"
-                        src={attachment.previewUrl}
-                        label={attachment.displayName}
-                        onRemove={onRemove}
-                      />
-                    );
-                  }
+                  // Astryx-standard rendering (maintainer decision on #2367's
+                  // follow-up): every attachment is a Token in the same chip
+                  // rhythm as quotes — kind icon + truncated name. The full
+                  // name and «EXT · size» meta live in a hover/focus Tooltip,
+                  // and an image with a decoded preview opens it in a
+                  // Lightbox on click instead of rendering an inline
+                  // thumbnail.
                   const extension = attachmentExtensionLabel(attachment.displayName);
                   const sizeLabel = formatPreviewSize(attachment.size, locale);
+                  // One string for both surfaces (chip tooltip + lightbox
+                  // caption), so the wording cannot drift between them.
+                  const detail = `${attachment.displayName} · ${
+                    extension ? `${extension} · ${sizeLabel}` : sizeLabel
+                  }`;
+                  const previewUrl =
+                    attachment.kind === 'image' ? attachment.previewUrl : undefined;
                   return (
-                    <span
+                    <Tooltip
                       key={`${attachment.displayName}-${index}`}
-                      className="maka-composer-attachment-card"
-                      data-kind={attachment.kind}
+                      content={detail}
+                      // "always", not the default "auto": the tooltip anchors
+                      // Token's non-focusable root span, so auto would never
+                      // attach focus listeners. focusin bubbles from the
+                      // chip's inner buttons, giving keyboard users the same
+                      // metadata hover shows.
+                      focusTrigger="always"
                     >
-                      <span className="maka-composer-attachment-card-icon" aria-hidden="true">
-                        <AttachmentKindIcon kind={attachment.kind} />
-                      </span>
-                      <span className="maka-composer-attachment-card-text">
-                        <span
-                          className="maka-composer-attachment-card-name"
-                          title={attachment.displayName}
-                        >
-                          {attachment.displayName}
-                        </span>
-                        <span className="maka-composer-attachment-card-meta">
-                          {extension ? `${extension} · ${sizeLabel}` : sizeLabel}
-                        </span>
-                      </span>
-                      {onRemove && (
-                        <button
-                          type="button"
-                          className="maka-composer-attachment-card-remove"
-                          aria-label={getConversationCopy(locale).messages.removeAttachmentAriaLabel(
-                            attachment.displayName,
-                          )}
-                          onClick={onRemove}
-                        >
-                          <X size={13} aria-hidden="true" />
-                        </button>
-                      )}
-                    </span>
+                      <Token
+                        size="sm"
+                        className="maka-composer-attachment-token"
+                        icon={<AttachmentKindIcon kind={attachment.kind} />}
+                        label={attachment.displayName}
+                        onRemove={onRemove}
+                        onClick={
+                          previewUrl
+                            ? () => {
+                                setAttachmentLightbox({
+                                  src: previewUrl,
+                                  alt: attachment.displayName,
+                                  caption: detail,
+                                });
+                                setAttachmentLightboxOpen(true);
+                              }
+                            : undefined
+                        }
+                      />
+                    </Tooltip>
                   );
                 })}
               </div>
@@ -1629,29 +1615,7 @@ export const Composer = forwardRef<
             </div>
           )}
           sendActions={(
-            <div className="maka-composer-right-controls">
-              {showVoiceCapture ? (
-                <IconButton
-                  variant="ghost"
-                  type="button"
-                  size="sm"
-                  className="maka-composer-voice-button"
-                  data-state={props.voiceCaptureState ?? 'idle'}
-                  isDisabled={
-                    props.disabled
-                    || props.voiceCaptureState === 'requesting'
-                    || props.voiceCaptureState === 'processing'
-                    || props.voiceCaptureState === 'sending'
-                  }
-                  label={voiceCaptureLabel}
-                  tooltip={`${voiceCaptureLabel}${props.voiceProviderLabel ? ` · ${props.voiceProviderLabel}` : ''}`}
-                  onClick={(event) => {
-                    void props.onToggleVoiceCapture?.({ dictate: event.shiftKey });
-                  }}
-                  icon={<Mic size={15} aria-hidden="true" />}
-                />
-              ) : null}
-            </div>
+            <div className="maka-composer-right-controls" />
           )}
           sendButton={props.streaming ? (
             <UiButton
@@ -1679,6 +1643,20 @@ export const Composer = forwardRef<
           )}
         />
       </form>
+      {attachmentLightbox && (
+        <Lightbox
+          // Driven by the flag, never by unmounting: the component must
+          // survive the close so Astryx runs dialog.close(), which is what
+          // hands focus back to the chip button that opened it (the native
+          // <dialog> contract keyboard users rely on).
+          isOpen={attachmentLightboxOpen}
+          onOpenChange={(isOpen) => {
+            if (!isOpen) setAttachmentLightboxOpen(false);
+          }}
+          hasZoom
+          media={attachmentLightbox}
+        />
+      )}
     </>
   );
 });
