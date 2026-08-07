@@ -67,9 +67,7 @@ export function buildChatModelChoices(connections: readonly LlmConnection[]): Ch
         model: entry.id,
         label: entry.displayName?.trim() || entry.id,
         ...(entry.description !== undefined ? { description: entry.description } : {}),
-        ...(entry.knowledgeCutoff !== undefined
-          ? { knowledgeCutoff: entry.knowledgeCutoff }
-          : {}),
+        ...(entry.knowledgeCutoff !== undefined ? { knowledgeCutoff: entry.knowledgeCutoff } : {}),
         ...(provider.authKind === 'oauth_token' ? {} : { connectionName: connection.name }),
         isDefault: entry.isDefault,
         thinkingLevels: thinkingVariantsForModel(connection.providerType, entry.id),
