@@ -23,3 +23,8 @@ test('subscription access paths stay unpriced instead of inheriting API rates', 
   assert.equal(getBuiltinPricing('github-copilot:gpt-5.5'), null);
   assert.equal(getBuiltinPricing('gemini-cli:gemini-2.5-pro'), null);
 });
+
+test('tiered models stay unpriced until runtime can select a tier', () => {
+  assert.equal(getBuiltinPricing('google:gemini-2.5-pro'), null);
+  assert.equal(getBuiltinPricing('MiniMax:MiniMax-M3'), null);
+});

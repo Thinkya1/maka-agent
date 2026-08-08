@@ -52,3 +52,13 @@ test('subscription access paths have no generated API pricing', () => {
     );
   }
 });
+
+test('known tiered models have no generated base pricing', () => {
+  for (const modelKey of ['google:gemini-2.5-pro', 'openai:gpt-5.5'] as const) {
+    assert.equal(
+      GENERATED_MODEL_PRICING.some((pricing) => pricing.modelKey === modelKey),
+      false,
+      `${modelKey} must not publish a base rate while tier selection is unsupported`,
+    );
+  }
+});

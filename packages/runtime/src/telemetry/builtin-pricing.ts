@@ -35,7 +35,6 @@ const LOCAL_PRICING_SUPPLEMENT: readonly PricingConfig[] = [
     cacheReadUsdPer1M: 0.075,
   },
   { modelKey: 'openai:o1', inputUsdPer1M: 15, outputUsdPer1M: 60, cacheReadUsdPer1M: 7.5 },
-  { modelKey: 'google:gemini-2.5-pro', inputUsdPer1M: 1.25, outputUsdPer1M: 10 },
   { modelKey: 'google:gemini-2.5-flash', inputUsdPer1M: 0.3, outputUsdPer1M: 2.5 },
   {
     modelKey: 'deepseek:deepseek-chat',
@@ -53,12 +52,6 @@ const LOCAL_PRICING_SUPPLEMENT: readonly PricingConfig[] = [
   { modelKey: 'zai-coding-plan:glm-4.7', inputUsdPer1M: 0.6, outputUsdPer1M: 2.2 },
   { modelKey: 'zai-coding-plan:glm-4.6', inputUsdPer1M: 0.6, outputUsdPer1M: 2.2 },
   { modelKey: 'zai-coding-plan:glm-4.5-air', inputUsdPer1M: 0.2, outputUsdPer1M: 0.8 },
-  {
-    modelKey: 'MiniMax:MiniMax-M3',
-    inputUsdPer1M: 0.3,
-    outputUsdPer1M: 1.2,
-    cacheReadUsdPer1M: 0.06,
-  },
   {
     modelKey: 'MiniMax-cn:MiniMax-M3',
     inputUsdPer1M: 0.3,

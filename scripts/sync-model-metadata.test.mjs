@@ -52,26 +52,13 @@ test('models.dev facts preserve the extended metadata contract', () => {
   );
 });
 
-test('models.dev pricing keeps base rates and ignores tiered rates', () => {
-  assert.deepEqual(
-    toPricing('openai', 'gpt-test', {
-      cost: {
-        input: 3,
-        output: 15,
-        cache_read: 0.3,
-        cache_write: 3.75,
-        context_over_200k: { input: 6, output: 30 },
-        tiers: [{ input: 6, output: 30 }],
-      },
-    }),
-    {
-      modelKey: 'openai:gpt-test',
-      inputUsdPer1M: 3,
-      outputUsdPer1M: 15,
-      cacheReadUsdPer1M: 0.3,
-      cacheWriteUsdPer1M: 3.75,
-    },
-  );
+test('models.dev pricing skips models with tiered rates until runtime supports tiers', () => {
+  for (const cost of [
+    { input: 3, output: 15, context_over_200k: { input: 6, output: 30 } },
+    { input: 3, output: 15, tiers: [{ input: 6, output: 30 }] },
+  ]) {
+    assert.equal(toPricing('openai', 'gpt-test', { cost }), undefined);
+  }
 });
 
 test('subscription and plan access paths do not inherit public API pricing', () => {
@@ -175,7 +162,18 @@ test('main() syncs only the mapped providers into the generated snapshot', async
     limit: { context: 1_000_000, input: 900_000, output: 64_000 },
     reasoning: true,
     tool_call: true,
-    cost: { input: 1.25, output: 10 },
+    cost: {
+      input: 1.25,
+      output: 10,
+      context_over_200k: { input: 2.5, output: 15 },
+    },
+  };
+  catalog.google.models['gemini-2.5-flash'] = {
+    name: 'Gemini 2.5 Flash',
+    limit: { context: 1_000_000, input: 900_000, output: 64_000 },
+    reasoning: true,
+    tool_call: true,
+    cost: { input: 0.3, output: 2.5 },
   };
   catalog['unmapped-provider'] = {
     id: 'unmapped-provider',
@@ -212,7 +210,8 @@ test('main() syncs only the mapped providers into the generated snapshot', async
   assert.match(out, /"kimi-for-coding": \{"api":"https:\/\/api\.kimi\.com\/coding\/v1"\}/);
   assert.doesNotMatch(pricing, /"modelKey":"kimi-coding-plan:k3"/);
   assert.doesNotMatch(pricing, /"modelKey":"github-copilot:gpt-5\.5"/);
-  assert.match(pricing, /"modelKey":"google:gemini-2\.5-pro","inputUsdPer1M":1\.25/);
+  assert.doesNotMatch(pricing, /"modelKey":"google:gemini-2\.5-pro"/);
+  assert.match(pricing, /"modelKey":"google:gemini-2\.5-flash","inputUsdPer1M":0\.3/);
   assert.doesNotMatch(pricing, /"modelKey":"gemini-cli:gemini-2\.5-pro"/);
   // The unmapped provider must appear only in the directory (the complete
   // upstream catalog), never as a snapshot segment or provider fact.

@@ -302,6 +302,16 @@ export function toPricing(providerType, modelId, model) {
   if (!cost || typeof cost !== 'object' || Array.isArray(cost)) {
     throw new Error(`models.dev model ${providerType}/${modelId} has an unsupported cost shape`);
   }
+  // PricingConfig and computeCost() currently represent one flat rate. Do
+  // not publish a base rate for a model whose actual price depends on input
+  // volume or an explicit tier table; that would systematically undercharge
+  // long-context requests until the runtime can select a tier by usage.
+  if (
+    Object.prototype.hasOwnProperty.call(cost, 'context_over_200k') ||
+    Object.prototype.hasOwnProperty.call(cost, 'tiers')
+  ) {
+    return undefined;
+  }
   const inputUsdPer1M = priceNumber(providerType, modelId, cost.input, 'input');
   const outputUsdPer1M = priceNumber(providerType, modelId, cost.output, 'output');
   const cacheReadUsdPer1M = optionalPriceNumber(
