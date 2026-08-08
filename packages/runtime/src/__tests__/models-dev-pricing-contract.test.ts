@@ -42,3 +42,13 @@ test('generated pricing stays keyed to generated model facts', () => {
 
   assert.deepEqual(gaps, []);
 });
+
+test('subscription access paths have no generated API pricing', () => {
+  for (const providerType of ['github-copilot', 'gemini-cli'] as const) {
+    assert.equal(
+      GENERATED_MODEL_PRICING.some(({ modelKey }) => modelKey.startsWith(`${providerType}:`)),
+      false,
+      `${providerType} must not inherit public API prices`,
+    );
+  }
+});

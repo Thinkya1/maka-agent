@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { toMetadata, toPricing, PROVIDERS } from './sync-model-metadata.mjs';
+import {
+  PRICING_EXCLUDED_PROVIDER_TYPES,
+  PROVIDERS,
+  toMetadata,
+  toPricing,
+} from './sync-model-metadata.mjs';
 
 const PROVIDER = { doc: 'https://example.com/docs' };
 const BASE_MODEL = {
@@ -67,6 +72,12 @@ test('models.dev pricing keeps base rates and ignores tiered rates', () => {
       cacheWriteUsdPer1M: 3.75,
     },
   );
+});
+
+test('subscription and plan access paths do not inherit public API pricing', () => {
+  assert.equal(PRICING_EXCLUDED_PROVIDER_TYPES.has('github-copilot'), true);
+  assert.equal(PRICING_EXCLUDED_PROVIDER_TYPES.has('gemini-cli'), true);
+  assert.equal(PRICING_EXCLUDED_PROVIDER_TYPES.has('zai-coding-plan'), true);
 });
 
 test('models.dev reasoning_options toggle passes through to thinkingOptions', () => {
@@ -152,6 +163,20 @@ test('main() syncs only the mapped providers into the generated snapshot', async
     cost: { input: 1, output: 2 },
     reasoning_options: [{ type: 'toggle' }, { type: 'effort', values: ['low', 'high', 'max'] }],
   };
+  catalog['github-copilot'].models['gpt-5.5'] = {
+    name: 'GPT-5.5',
+    limit: { context: 400_000, input: 272_000, output: 128_000 },
+    reasoning: true,
+    tool_call: true,
+    cost: { input: 5, output: 30 },
+  };
+  catalog.google.models['gemini-2.5-pro'] = {
+    name: 'Gemini 2.5 Pro',
+    limit: { context: 1_000_000, input: 900_000, output: 64_000 },
+    reasoning: true,
+    tool_call: true,
+    cost: { input: 1.25, output: 10 },
+  };
   catalog['unmapped-provider'] = {
     id: 'unmapped-provider',
     name: 'Unmapped',
@@ -185,7 +210,10 @@ test('main() syncs only the mapped providers into the generated snapshot', async
   assert.match(out, /"thinkingOptions":\{"efforts":\["low","high","max"\],"toggle":true\}/);
   assert.match(out, /"kimi-for-coding": \{/);
   assert.match(out, /"kimi-for-coding": \{"api":"https:\/\/api\.kimi\.com\/coding\/v1"\}/);
-  assert.match(pricing, /"modelKey":"kimi-coding-plan:k3","inputUsdPer1M":1,"outputUsdPer1M":2/);
+  assert.doesNotMatch(pricing, /"modelKey":"kimi-coding-plan:k3"/);
+  assert.doesNotMatch(pricing, /"modelKey":"github-copilot:gpt-5\.5"/);
+  assert.match(pricing, /"modelKey":"google:gemini-2\.5-pro","inputUsdPer1M":1\.25/);
+  assert.doesNotMatch(pricing, /"modelKey":"gemini-cli:gemini-2\.5-pro"/);
   // The unmapped provider must appear only in the directory (the complete
   // upstream catalog), never as a snapshot segment or provider fact.
   const directoryStart = out.indexOf('GENERATED_MODELS_DEV_DIRECTORY');

@@ -4,7 +4,33 @@ import { pathToFileURL } from 'node:url';
 const SOURCE_URL = 'https://models.dev/api.json';
 const DEFAULT_OUTPUT = 'packages/core/src/model-metadata.generated.ts';
 const DEFAULT_PRICING_OUTPUT = 'packages/runtime/src/telemetry/model-pricing.generated.ts';
-const PRICING_EXCLUDED_PROVIDER_TYPES = new Set(['zai-coding-plan', 'MiniMax-cn']);
+// models.dev cost fields describe the catalog provider's public API. They are
+// not automatically the rate a user pays on an OAuth, free, subscription, or
+// plan access path. Such paths stay unpriced unless builtin-pricing.ts carries
+// an explicit rate for that exact path.
+export const PRICING_EXCLUDED_PROVIDER_TYPES = new Set([
+  'alibaba-coding-plan-cn',
+  'alibaba-coding-plan',
+  'alibaba-token-plan-cn',
+  'alibaba-token-plan',
+  'github-copilot',
+  'gemini-cli',
+  'kimi-coding-plan',
+  'minimax-coding-plan',
+  'MiniMax-cn',
+  'opencode-free',
+  'opencode-go',
+  'stepfun-ai-step-plan',
+  'stepfun-step-plan',
+  'tencent-coding-plan',
+  'tencent-token-plan',
+  'volcengine-agent-plan',
+  'volcengine-coding-plan',
+  'xiaomi-token-plan-ams',
+  'xiaomi-token-plan-cn',
+  'xiaomi-token-plan-sgp',
+  'zai-coding-plan',
+]);
 export const PROVIDERS = {
   anthropic: 'anthropic',
   alibaba: 'alibaba',

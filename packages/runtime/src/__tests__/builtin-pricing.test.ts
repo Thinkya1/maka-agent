@@ -18,3 +18,8 @@ test('special access-path pricing remains in the local supplement', () => {
     outputUsdPer1M: 2.2,
   });
 });
+
+test('subscription access paths stay unpriced instead of inheriting API rates', () => {
+  assert.equal(getBuiltinPricing('github-copilot:gpt-5.5'), null);
+  assert.equal(getBuiltinPricing('gemini-cli:gemini-2.5-pro'), null);
+});
