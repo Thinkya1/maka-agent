@@ -10,8 +10,7 @@ concurrency:
   group: sync-fork-main
   cancel-in-progress: false
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   sync:
@@ -21,8 +20,14 @@ jobs:
     steps:
       - name: Fast-forward fork main from upstream
         env:
-          GH_TOKEN: ${{ github.token }}
+          # merge-upstream may update .github/workflows files. The Actions
+          # GITHUB_TOKEN cannot receive the required Workflows permission.
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
         run: |
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo '::error::FORK_SYNC_TOKEN repository secret is not configured'
+            exit 1
+          fi
           curl --fail-with-body --silent --show-error \
             --request POST \
             --header "Accept: application/vnd.github+json" \
