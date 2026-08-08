@@ -1,10 +1,12 @@
 import {
   buildBotPlatformPromptFragment,
   buildDeepResearchSystemPromptFragment,
+  buildSideConversationSystemPromptFragment,
   filterModelVisibleTaskLedgerTasks,
   buildLocalMemoryPromptBody,
   botPlatformFromSessionLabels,
   isDeepResearchSession,
+  isSideConversationSession,
   redactSecrets,
   renderTaskLedgerPromptText,
   type AppSettings,
@@ -13,6 +15,7 @@ import {
   type TaskLedgerStore,
 } from '@maka/core';
 import {
+  assembleMainSessionSystemPrompt,
   buildPersonalizationPromptFragment,
   buildWorkspaceInstructionsPromptFragment,
   resolveProjectGitInfo,
@@ -50,7 +53,7 @@ export function createSystemPromptMainService(deps: SystemPromptMainDeps) {
   async function buildSystemPrompt(
     header: Pick<SessionHeader, 'labels'>,
     cwd?: string,
-    options?: { memoryFragment?: string | null; includePersonalization?: boolean; skillBudget?: SkillPromptBudgetContext; host?: HostCapabilities },
+    options?: { memoryFragment?: string | null; includePersonalization?: boolean; includeIdentity?: boolean; skillBudget?: SkillPromptBudgetContext; host?: HostCapabilities },
   ): Promise<string | undefined> {
     const settings = await deps.settingsStore.get();
     const includePersonalization = options?.includePersonalization !== false;
@@ -70,20 +73,30 @@ export function createSystemPromptMainService(deps: SystemPromptMainDeps) {
       ? await buildWorkspaceInstructionsPromptFragment(cwd)
       : undefined;
     const deepResearch = isDeepResearchSession(header.labels) ? buildDeepResearchSystemPromptFragment() : undefined;
+    const sideConversation = isSideConversationSession(header.labels)
+      ? buildSideConversationSystemPromptFragment()
+      : undefined;
     const botPlatform = botPlatformFromSessionLabels(header.labels);
     const botPlatformHint = botPlatform ? buildBotPlatformPromptFragment(botPlatform) : undefined;
     const memoryFragment = options && 'memoryFragment' in options
       ? options.memoryFragment ?? undefined
       : await buildLocalMemoryPromptFragment();
-    const fragments = [
-      personalization.text,
-      deepResearch,
-      botPlatformHint,
-      skills,
-      workspaceInstructions,
-      memoryFragment,
-    ].filter((fragment): fragment is string => Boolean(fragment));
-    return fragments.length > 0 ? fragments.join('\n\n') : undefined;
+    // Fragment order is load-bearing: the Side Chat isolation boundary
+    // (sideConversation) is a trailing assertion that constrains the fragments
+    // before it, so it must stay last. Keep this order in sync with the
+    // entry-level prompt-order test.
+    return assembleMainSessionSystemPrompt(
+      [
+        personalization.text,
+        deepResearch,
+        botPlatformHint,
+        skills,
+        workspaceInstructions,
+        memoryFragment,
+        sideConversation,
+      ],
+      { identity: options?.includeIdentity !== false },
+    );
   }
 
   async function buildBackendSystemPrompt(
@@ -93,7 +106,7 @@ export function createSystemPromptMainService(deps: SystemPromptMainDeps) {
   ): Promise<string | undefined> {
     const childInstruction = options.childInstruction?.trim();
     const base = await buildSystemPrompt(header, cwd, childInstruction
-      ? { memoryFragment: null, includePersonalization: false, skillBudget: options.skillBudget, host: options.host }
+      ? { memoryFragment: null, includePersonalization: false, includeIdentity: false, skillBudget: options.skillBudget, host: options.host }
       : { memoryFragment: options.memoryFragment, skillBudget: options.skillBudget, host: options.host });
     if (!childInstruction) return base;
     return [

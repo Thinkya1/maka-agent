@@ -50,7 +50,9 @@ import {
   buildParentAgentTools,
   listRunnableBuiltinAgentDefinitions,
   listInvocableSkills,
+  renderAgentSwarmSupervisorWake,
   prepareSkillInvocationMessage,
+  shouldWakeAgentSwarmSupervisor,
   resolveSkillDiscoveryPaths,
 } from '@maka/runtime';
 import type {
@@ -664,6 +666,9 @@ const shellRuns = new ShellRunProcessManager({
   onShellRunUpdate: (update) => {
     safeSendToRenderer('shell-runs:update', update);
   },
+  onPtyData: (event) => {
+    safeSendToRenderer('shell-runs:pty-data', event);
+  },
 });
 const updateService = createAppUpdateService({
   currentVersion: app.getVersion(),
@@ -1020,6 +1025,8 @@ agentGraphSupervisorWakeCoordinator = new AgentGraphSupervisorWakeCoordinator({
     }
     return runs[0]?.status ?? 'missing';
   },
+  shouldWake: shouldWakeAgentSwarmSupervisor,
+  renderWake: renderAgentSwarmSupervisorWake,
   newId: randomUUID,
   onError: (rootSessionId) => {
     emitSessionsChanged('status-change', rootSessionId);
@@ -1034,6 +1041,9 @@ agentGraphCoordinator = new AgentGraphCoordinator({
   newId: randomUUID,
   onReconciliation: (rootSessionId, result) => {
     agentGraphSupervisorWakeCoordinator.notify(rootSessionId, result);
+  },
+  onCheckpoint: (rootSessionId) => {
+    agentGraphSupervisorWakeCoordinator.notify(rootSessionId);
   },
 });
 let settingsIpc: SettingsIpcHandle | undefined;
@@ -1147,6 +1157,7 @@ function registerIpc(): void {
   registerSessionsIpc({
     workspaceRoot,
     runtime,
+    shellRuns,
     store,
     taskLedgerStore,
     goalWiring,

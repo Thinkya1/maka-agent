@@ -4,6 +4,7 @@ import {
   isDeepResearchSession,
 } from '@maka/core/explore-agent';
 import { resolveModelVisionSupport } from '@maka/core/model-metadata';
+import { relayModelProfile } from '@maka/core/model-thinking';
 import { activePlanExecution, type PlanSessionState, type PlanStore } from '@maka/core/plan';
 import type { ModelCallAttempt } from '@maka/core/model-call-attempt';
 import type { RuntimePolicy } from '@maka/core/runtime-policy';
@@ -19,6 +20,7 @@ import {
   buildDefaultContextBudgetPolicy,
   buildHostCapabilitiesFromBinding,
   buildLlmHistorySummarizer,
+  assembleMainSessionSystemPrompt,
   buildPersonalizationPromptFragment,
   buildCancelPlanTool,
   buildParentAgentTools,
@@ -219,7 +221,11 @@ export function createHostExecutionModelComposition(
           childInstruction,
         ]);
       }
-      return joinFragments([
+      // Fragment order is load-bearing: the Deep Research mode contract
+      // (deepResearch) is a trailing assertion that constrains the fragments
+      // before it, so it must stay last. Keep this order in sync with the
+      // entry-level prompt-order test.
+      return assembleMainSessionSystemPrompt([
         buildPersonalizationPromptFragment(promptState.policy.personalization).text,
         skills.text,
         workspaceInstructions,
@@ -575,6 +581,7 @@ export async function createHostAiSdkBackend(input: HostAiSdkBackendInput): Prom
           target.connection.providerType,
           target.connection.models,
           target.model,
+          relayModelProfile(target.connection, target.model)?.vision,
         ),
         readAttachmentBytes: createAttachmentByteReader({
           artifactStore: input.artifacts,

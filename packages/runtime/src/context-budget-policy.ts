@@ -1,5 +1,6 @@
 import type { RuntimeExecutionConnection } from '@maka/core/llm-connections';
 import { lookupModelMetadata } from '@maka/core/model-metadata';
+import { relayModelProfile } from '@maka/core/model-thinking';
 import type { ContextBudgetPolicy } from './context-budget.js';
 import { finitePositive } from './context-budget-helpers.js';
 
@@ -413,12 +414,14 @@ export function resolveSelectedModelContextWindow(
   modelId: string | undefined,
 ): number | undefined {
   const selectedModelId = modelId ?? connection.defaultModel;
-  const model = selectedModelId
-    ? connection.models?.find((candidate) => candidate.id === selectedModelId)
-    : undefined;
-  const metadata = selectedModelId
-    ? lookupModelMetadata(connection.providerType, selectedModelId)
-    : undefined;
+  if (selectedModelId === undefined) return undefined;
+  // A user declaration outranks both the relay's /models report and generated
+  // metadata — mirrors the declared-vision precedence in model-metadata.ts,
+  // through the same provider-gated seam (relay declarations only).
+  const declared = relayModelProfile(connection, selectedModelId)?.contextWindow;
+  if (declared !== undefined) return declared;
+  const model = connection.models?.find((candidate) => candidate.id === selectedModelId);
+  const metadata = lookupModelMetadata(connection.providerType, selectedModelId);
   return (
     positiveInputLimit(model?.inputLimit) ??
     positiveInputLimit(metadata?.inputLimit) ??

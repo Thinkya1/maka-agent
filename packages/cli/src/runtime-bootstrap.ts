@@ -47,10 +47,12 @@ import {
   listRunnableBuiltinAgentDefinitions,
   replayPlanItemsToModelMessages,
   recoverAgentGraphSupervisorContextOverflow,
+  renderAgentSwarmSupervisorWake,
   resolveSkillDiscoveryPaths,
   resolveSelectedModelContextWindow,
   projectEffectiveProductToolSurface,
   routeWebSearchTools,
+  shouldWakeAgentSwarmSupervisor,
   type AutomationDefinition,
   type EffectiveProductToolSurface,
   type HostCapabilitiesResolver,
@@ -84,7 +86,7 @@ import { resolveStorageRoot } from '@maka/storage/root-authority';
 import { resolveWorkspaceIdentity } from '@maka/storage/workspace-identity';
 import { fetchProviderModels } from '@maka/runtime';
 import { createApiKeyOnboardingSurface } from './onboarding.js';
-import { isActiveShellRunStatus, resolveModelVisionSupport } from '@maka/core';
+import { relayModelProfile, isActiveShellRunStatus, resolveModelVisionSupport } from '@maka/core';
 import type { ReadySessionTarget } from './connection-target.js';
 import {
   listReadyModelChoices,
@@ -746,6 +748,7 @@ export async function createMakaCliRuntimeContext(
         ready.connection.providerType,
         ready.connection.models,
         ready.model,
+        relayModelProfile(ready.connection, ready.model)?.vision,
       ),
       readAttachmentBytes: createAttachmentByteReader({ artifactStore, sessionId: ctx.sessionId }),
       loadHistoryCompact: (event) => loadHistoryCompactBlocksFromArtifacts(artifactStore, event),
@@ -990,6 +993,8 @@ export async function createMakaCliRuntimeContext(
           abortSignal,
           compactSession: (sessionId, input) => runtime.compactSession(sessionId, input),
         }),
+      shouldWake: shouldWakeAgentSwarmSupervisor,
+      renderWake: renderAgentSwarmSupervisorWake,
       newId: randomUUID,
       onDiagnostic: (diagnostic) => {
         console.warn('[agent-graph-supervisor-wake]', JSON.stringify(diagnostic));
@@ -1007,6 +1012,9 @@ export async function createMakaCliRuntimeContext(
       newId: randomUUID,
       onReconciliation: (rootSessionId, result) => {
         agentGraphSupervisorWakeCoordinator!.notify(rootSessionId, result);
+      },
+      onCheckpoint: (rootSessionId) => {
+        agentGraphSupervisorWakeCoordinator!.notify(rootSessionId);
       },
       onError: (rootSessionId, error) => {
         agentGraphErrors.set(rootSessionId, error);
