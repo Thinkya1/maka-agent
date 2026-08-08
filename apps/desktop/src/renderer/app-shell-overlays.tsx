@@ -3,6 +3,7 @@ import type {
   ChatDefaultPermissionMode,
   LlmConnection,
   ProviderType,
+  SessionSummary,
   SettingsSection,
   ThemePalette,
   ThemePreference,
@@ -15,6 +16,7 @@ import { useAppShellCommands, type AppShellCommandListOptions } from './app-shel
 import type { UiLocaleUpdateGate } from './settings/ui-locale-update-gate';
 import { getShellRemainingCopy } from './locales/shell-remaining-copy.js';
 import { desktopPricingSettingsPort } from './settings/runtime-host-pricing-port';
+import { ExternalSessionImportDialog } from './external-session-import-dialog.js';
 
 // Settings is a large surface (providers, OAuth, network, bots, daily-review,
 // usage, etc.) that is only needed once the user opens the Settings modal.
@@ -70,6 +72,9 @@ export function AppShellOverlays(props: {
   paletteOpen: boolean;
   closePalette(): void;
   commandOptions: AppShellCommandListOptions;
+  externalImportOpen: boolean;
+  onExternalImportOpenChange(open: boolean): void;
+  onExternalSessionImported(session: SessionSummary): void;
 }) {
   const {
     closeHelp,
@@ -98,6 +103,9 @@ export function AppShellOverlays(props: {
     setDefaultPermissionMode,
     themePalette,
     themePref,
+    externalImportOpen,
+    onExternalImportOpenChange,
+    onExternalSessionImported,
   } = props;
 
   // #1045: base commands freeze per open/close; session rows stay live on
@@ -151,6 +159,11 @@ export function AppShellOverlays(props: {
           if (!open) closePalette();
         }}
         commands={commands}
+      />
+      <ExternalSessionImportDialog
+        isOpen={externalImportOpen}
+        onOpenChange={onExternalImportOpenChange}
+        onImported={onExternalSessionImported}
       />
     </>
   );

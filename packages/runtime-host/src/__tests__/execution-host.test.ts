@@ -16,7 +16,8 @@ import { connect, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { canonicalToolArgsHash, TOOL_BOUNDARY_PROTOCOL_V1 } from '@maka/core';
+import { TOOL_BOUNDARY_PROTOCOL_V1 } from '@maka/core';
+import { canonicalToolArgsHash } from '@maka/core/tool-args-identity';
 import type { AgentRunHeader } from '@maka/core/agent-run';
 import type { MessageContent } from '@maka/core/events';
 import type { ConnectionCatalogEntry } from '@maka/core/runtime-policy';
@@ -80,6 +81,7 @@ import {
   assertJsonLines,
   attachment,
   connectClient,
+  requireStartedTurn,
   operationError,
   quotedContent,
   sendStartWithoutReadingResponse,
@@ -349,8 +351,9 @@ async function seedDispatchedClientCapability(
   const owner = await tryAcquireInteractiveRootOwner(fixture.capability);
   assert.ok(owner);
   if (!owner) throw new Error('Unable to acquire execution root for Client Capability setup');
+  let stores: Awaited<ReturnType<typeof openInteractiveExecutionStoresForWrite>> | undefined;
   try {
-    const stores = await openInteractiveExecutionStoresForWrite(owner.lease);
+    stores = await openInteractiveExecutionStoresForWrite(owner.lease);
     const operationId = 'client-capability-before-ready';
     const invocationId = `${operationId}-invocation`;
     const runId = `${operationId}-run`;
@@ -412,6 +415,7 @@ async function seedDispatchedClientCapability(
     });
     return { runId, toolName };
   } finally {
+    await stores?.sessionStore.close?.();
     await owner.close();
   }
 }
@@ -572,13 +576,15 @@ test('two Clients share one execution after the starting Client disconnects', as
     const second = await connectClient(fixture.root, 'tui');
     const turnId = randomUUID();
 
-    const started = await first.startTurn(
-      {
-        sessionId: fixture.sessionId,
-        turnId,
-        content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
-      },
-      PROCESS_TIMEOUT_MS,
+    const started = requireStartedTurn(
+      await first.startTurn(
+        {
+          sessionId: fixture.sessionId,
+          turnId,
+          content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
+        },
+        PROCESS_TIMEOUT_MS,
+      ),
     );
     assert.equal(started.turnId, turnId);
     const secondSubscription = await second.openSessionSubscription({
@@ -660,22 +666,26 @@ test('two Clients share one execution after the starting Client disconnects', as
     );
 
     const nextTurnId = randomUUID();
-    const next = await second.startTurn(
-      {
-        sessionId: fixture.sessionId,
-        turnId: nextTurnId,
-        content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
-      },
-      PROCESS_TIMEOUT_MS,
-    );
-    assert.deepEqual(
+    const next = requireStartedTurn(
       await second.startTurn(
         {
           sessionId: fixture.sessionId,
-          turnId,
+          turnId: nextTurnId,
           content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
         },
         PROCESS_TIMEOUT_MS,
+      ),
+    );
+    assert.deepEqual(
+      requireStartedTurn(
+        await second.startTurn(
+          {
+            sessionId: fixture.sessionId,
+            turnId,
+            content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
+          },
+          PROCESS_TIMEOUT_MS,
+        ),
       ),
       stopped,
     );
@@ -841,11 +851,13 @@ test('context actions share root admission and expose backend capability honestl
         status: 'unavailable',
         reason: 'no_completed_request',
       });
-      const started = await first.startTurn({
-        sessionId: fixture.sessionId,
-        turnId,
-        content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
-      });
+      const started = requireStartedTurn(
+        await first.startTurn({
+          sessionId: fixture.sessionId,
+          turnId,
+          content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
+        }),
+      );
       await waitForRunningTurn(second, fixture.sessionId, turnId);
       await assert.rejects(
         second.compactContext({
@@ -887,11 +899,13 @@ test('a disconnected Client leaves a durable Interaction that another Client can
     const firstHost = await fixture.startHost();
     const first = await connectClient(fixture.root, 'desktop');
     const turnId = randomUUID();
-    const started = await first.startTurn({
-      sessionId: fixture.sessionId,
-      turnId,
-      content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
-    });
+    const started = requireStartedTurn(
+      await first.startTurn({
+        sessionId: fixture.sessionId,
+        turnId,
+        content: { text: FAKE_ASK_USER_QUESTION_PROMPT },
+      }),
+    );
     await first.close();
 
     const second = await connectClient(fixture.root, 'tui');
@@ -992,11 +1006,13 @@ test('two UDS Clients settle one hosted sandbox boundary and resume its exact Ru
     const subscription = await first.openSessionSubscription({ sessionId: fixture.sessionId });
     const probe = new SubscriptionProbe(subscription);
     const turnId = randomUUID();
-    const started = await starter.startTurn({
-      sessionId: fixture.sessionId,
-      turnId,
-      content: { text: FAKE_ASK_SANDBOX_BOUNDARY_PROMPT },
-    });
+    const started = requireStartedTurn(
+      await starter.startTurn({
+        sessionId: fixture.sessionId,
+        turnId,
+        content: { text: FAKE_ASK_SANDBOX_BOUNDARY_PROMPT },
+      }),
+    );
     await starter.close();
 
     const pending = await waitForPendingInteraction(subscription, probe, started.runId);
@@ -1088,13 +1104,15 @@ async function withOwnedTaskLedgerToolPort<T>(
   const owner = await tryAcquireInteractiveRootOwner(fixture.capability);
   assert.ok(owner);
   if (!owner) throw new Error('Unable to acquire the interactive Task Ledger tool port');
+  let writer: Awaited<ReturnType<typeof openInteractiveTaskLedgerStoreForWrite>> | undefined;
   try {
-    const writer = await openInteractiveTaskLedgerStoreForWrite(owner.lease);
+    writer = await openInteractiveTaskLedgerStoreForWrite(owner.lease);
     const coordinator = new HostTaskLedgerCoordinator(writer, new SessionAdmissionGate(), {
       probeSessionRemoval: async () => ({ kind: 'present' }),
     });
     return await run(coordinator, buildTaskLedgerTools({ store: coordinator }));
   } finally {
+    writer?.close();
     await owner.close();
   }
 }

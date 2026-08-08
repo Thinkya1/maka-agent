@@ -3,6 +3,7 @@ import { encodeIngestItems } from './attachment-ingest-payload.js';
 import type {
   MakaBridge,
   OnboardingSnapshot,
+  DesktopTaskSubmissionReadinessRequest,
   PermissionActionResult,
   PermissionOverlayStartResult,
   RendererIngestInput,
@@ -14,6 +15,7 @@ import type {
   WindowCommand,
   PetPackChangedEvent,
 } from './bridge-contract.js';
+import type { ExternalSessionImportIpcResult } from './external-session-import-result.js';
 import type {
   ConnectionEvent,
   ConnectionTestResult,
@@ -53,6 +55,7 @@ import type {
   UsageRange,
   UsageStats,
   E2eFixtureState,
+  ExternalSessionSummary,
   GitReviewReadResult,
   GitReviewMutationAction,
   GitReviewMutationResult,
@@ -402,6 +405,25 @@ const makaBridge = {
       return ipcRenderer.invoke('sessions:abandonSessionCopy', sessionId);
     },
   },
+  externalSessions: {
+    listSources(): Promise<{ adapterIds: string[] }> {
+      return ipcRenderer.invoke('external-sessions:listSources');
+    },
+    list(input: {
+      adapterId: string;
+      includeArchived?: boolean;
+      cwd?: string;
+      cursor?: string;
+    }): Promise<{ sessions: ExternalSessionSummary[]; nextCursor: string | null }> {
+      return ipcRenderer.invoke('external-sessions:list', input);
+    },
+    import(input: {
+      adapterId: string;
+      sourceSessionId: string;
+    }): Promise<ExternalSessionImportIpcResult> {
+      return ipcRenderer.invoke('external-sessions:import', input);
+    },
+  },
   projects: {
     list(): Promise<ProjectRecord[]> {
       return ipcRenderer.invoke('projects:list');
@@ -449,6 +471,9 @@ const makaBridge = {
       ref: string;
     }): Promise<ShellRunPtySnapshot | null> {
       return ipcRenderer.invoke('shell-runs:attach', input);
+    },
+    detach(input: { sessionId: string; ref: string }): Promise<void> {
+      return ipcRenderer.invoke('shell-runs:detach', input);
     },
     start(sessionId: string): Promise<ShellRunUpdate> {
       return ipcRenderer.invoke('shell-runs:start', sessionId);
@@ -593,6 +618,11 @@ const makaBridge = {
     },
     clearMilestone(id: OnboardingMilestoneId): Promise<OnboardingSnapshot> {
       return ipcRenderer.invoke('onboarding:clearMilestone', id);
+    },
+  },
+  taskReadiness: {
+    getSnapshot(input?: DesktopTaskSubmissionReadinessRequest) {
+      return ipcRenderer.invoke('taskReadiness:getSnapshot', input);
     },
   },
   permissions: {
@@ -1093,6 +1123,7 @@ const makaBridge = {
       osRelease: string;
       workspacePath: string;
       homePath: string;
+      operationalStateDatabasePath: string;
       projectId?: string | null;
       projectPath: string;
       projectGit: { isGitRepo: boolean; branch?: string };

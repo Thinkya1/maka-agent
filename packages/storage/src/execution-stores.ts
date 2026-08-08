@@ -16,6 +16,7 @@ import {
   type AgentRunIdentitySearchResult,
   type AdmitRootTurnInput,
   type AdmitRootTurnResult,
+  type CommitRootTurnStartRejectionInput,
   type BoundedEvidenceReadResult,
   type DurableAgentRunStore,
   type DurableRuntimeEventStore,
@@ -79,13 +80,17 @@ export type {
   AgentRunIdentitySearchResult,
   AdmitRootTurnInput,
   AdmitRootTurnResult,
+  CommitRootTurnStartRejectionInput,
+  CommitRootTurnStartRejectionResult,
   BoundedEvidenceReadResult,
   EvidenceReadBudget,
   ImmutableSteeringMessageProof,
   RootTurnAdmission,
   RootTurnAdmissionStore,
+  RootTurnStartRejectionStore,
   RootTurnSourceMessage,
   RootTurnSourceMessageReceipt,
+  RootTurnStartRejection,
 } from './agent-run-store.js';
 export type {
   MessageOperationReceipt,
@@ -157,6 +162,12 @@ export interface ExecutionAgentRunReader {
   readEventsBounded(
     sessionId: string,
     runId: string,
+    budget: EvidenceReadBudget,
+  ): Promise<BoundedEvidenceReadResult<AgentRunEvent>>;
+  readEventsByTypeBounded(
+    sessionId: string,
+    runId: string,
+    type: AgentRunEventType,
     budget: EvidenceReadBudget,
   ): Promise<BoundedEvidenceReadResult<AgentRunEvent>>;
   readEventProjection(
@@ -316,6 +327,8 @@ async function createExecutionStoresForWrite<K extends StorageRootKind, E extend
       run(() => conversationOperationalStateStore.purge(sessionId)),
     sessionStore: {
       create: (input, initialBoundary) => run(() => sessionStore.create(input, initialBoundary)),
+      createImportedSession: (input, messages) =>
+        run(() => sessionStore.createImportedSession(input, messages)),
       probeStableSessionCreate: (sessionId, requestFingerprint) =>
         run(() => sessionStore.probeStableSessionCreate(sessionId, requestFingerprint)),
       createStableSession: (request, initialBoundary) =>
@@ -418,6 +431,8 @@ async function createExecutionStoresForWrite<K extends StorageRootKind, E extend
       readEvents: (sessionId, runId) => run(() => agentRunStore.readEvents(sessionId, runId)),
       readEventsBounded: (sessionId, runId, budget) =>
         run(() => agentRunStore.readEventsBounded(sessionId, runId, budget)),
+      readEventsByTypeBounded: (sessionId, runId, type, budget) =>
+        run(() => agentRunStore.readEventsByTypeBounded(sessionId, runId, type, budget)),
       readEventsForRecovery: (sessionId, runId) =>
         run(() => agentRunStore.readEventsForRecovery(sessionId, runId)),
       readEventsForEvidence: (sessionId, runId) =>
@@ -430,6 +445,10 @@ async function createExecutionStoresForWrite<K extends StorageRootKind, E extend
         run(() => agentRunStore.admitRootTurn(input)),
       readRootTurnAdmission: (sessionId, turnId) =>
         run(() => agentRunStore.readRootTurnAdmission(sessionId, turnId)),
+      readRootTurnStartRejection: (sessionId, turnId) =>
+        run(() => agentRunStore.readRootTurnStartRejection(sessionId, turnId)),
+      commitRootTurnStartRejection: (input: CommitRootTurnStartRejectionInput) =>
+        run(() => agentRunStore.commitRootTurnStartRejection(input)),
       readRootTurnSourceMessageReceipt: (sessionId, sourceMessageId) =>
         run(() => agentRunStore.readRootTurnSourceMessageReceipt(sessionId, sourceMessageId)),
       listRootTurnAdmissionsForRecovery: (sessionId) =>
@@ -564,6 +583,8 @@ async function openExecutionStoresForRead<K extends StorageRootKind, E extends o
       readEvents: (sessionId, runId) => run(() => agentRunStore.readEvents(sessionId, runId)),
       readEventsBounded: (sessionId, runId, budget) =>
         run(() => agentRunStore.readEventsBounded(sessionId, runId, budget)),
+      readEventsByTypeBounded: (sessionId, runId, type, budget) =>
+        run(() => agentRunStore.readEventsByTypeBounded(sessionId, runId, type, budget)),
       readEventProjection: (sessionId, type) =>
         run(() => agentRunStore.readEventProjection(sessionId, type)),
       readRootTurnAdmission: (sessionId, turnId) =>

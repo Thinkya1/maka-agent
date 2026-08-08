@@ -55,6 +55,7 @@ import { MessageCircleQuestion } from '@maka/ui/icons';
 import { useKeyboardHelp } from './keyboard-help';
 import { useCommandPalette } from './command-palette';
 import { ChatMessageSurface } from './chat-message-surface';
+import { deriveWorkspaceReadinessRecovery } from './workspace-readiness-recovery';
 import { LiveTurnReconciler } from './live-turn-reconciler';
 import { useAppShellSessionUiReads } from './use-app-shell-session-ui-reads';
 import { AgentGraphPanel } from './agent-graph-panel';
@@ -77,7 +78,6 @@ import {
   openCompanionPanel,
   removeStagedCompanionQuote,
   stageCompanionQuote,
-  type QuoteCompanionPanelState,
 } from './quote-companion-panel-state';
 import {
   parseSideChatCommand,
@@ -181,6 +181,8 @@ import { useShellLiveTurn } from './use-shell-live-turn';
 import { useShellLayout } from './use-shell-layout';
 import { useShellResume } from './use-shell-resume';
 import { filterUserVisibleArtifacts } from './artifact-visibility';
+import { recoverOrphanedCompanionCopies } from './quote-companion-core';
+import { useSideConversationWorkspace } from './use-side-conversation-workspace';
 
 function rebaseWorkspaceFileReferences(
   sourceText: string,
@@ -554,6 +556,7 @@ function AppShellContent({
   const persistedComposerDefaults = loadComposerDefaults();
   const [helpOpen, closeHelp, openHelp] = useKeyboardHelp();
   const [paletteOpen, openPalette, closePalette] = useCommandPalette();
+  const [externalImportOpen, setExternalImportOpen] = useState(false);
   const [viewMode, setViewMode] = useState<SessionViewMode>('conversation');
   const composerRef = useRef<ComposerHandle>(null);
   // The rail's toggle has to reach Astryx's resizable state, not just this
@@ -561,15 +564,12 @@ function AppShellContent({
   // for the whole shell, so the handle is always live by the time it is called.
   const sessionSideNavHandleRef = useRef<SideNavImperativeCollapseHandle | null>(null);
   // Codex-style side conversations: each workbar tab owns a separate transient
-  // read-only fork, composer draft, quote queue, and cleanup lifecycle.
-  const [quotePanels, setQuotePanels] = useState<QuoteCompanionPanelState[]>([]);
-  const [sideChatContentPanelIds, setSideChatContentPanelIds] = useState<ReadonlySet<string>>(
-    () => new Set(),
-  );
-  const [sideChatPreparingPanelIds, setSideChatPreparingPanelIds] =
-    useState<ReadonlySet<string>>(() => new Set());
-  const [sideChatActivePanelIds, setSideChatActivePanelIds] =
-    useState<ReadonlySet<string>>(() => new Set());
+  // fork, composer draft, quote queue, and cleanup lifecycle.
+  const sideConversations = useSideConversationWorkspace();
+  const quotePanels = sideConversations.panels;
+  const sideChatContentPanelIds = sideConversations.contentPanelIds;
+  const sideChatPreparingPanelIds = sideConversations.preparingPanelIds;
+  const sideChatActivePanelIds = sideConversations.activePanelIds;
   const [pendingSideChatClose, setPendingSideChatClose] =
     useState<Array<{ placement: SessionWorkbarPlacement; tab: SessionWorkbarTab }>>(
       [],
@@ -584,6 +584,12 @@ function AppShellContent({
   const [hiddenCompanionForkIds, setHiddenCompanionForkIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  const companionRecoveryStartedRef = useRef(false);
+  useLayoutEffect(() => {
+    if (companionRecoveryStartedRef.current) return;
+    companionRecoveryStartedRef.current = true;
+    void recoverOrphanedCompanionCopies(window.maka.sessions);
+  }, []);
   const onCompanionForkVisibilityChange = useCallback(
     (event: Parameters<typeof applyCompanionForkVisibilityEvent>[1]) =>
       setHiddenCompanionForkIds((current) =>
@@ -1253,6 +1259,12 @@ function AppShellContent({
     onboardingState !== undefined &&
     onboardingState.kind !== 'ready_with_history' &&
     onboardingState.kind !== 'ready_empty';
+  const workspaceReadinessRecovery = deriveWorkspaceReadinessRecovery({
+    state: onboardingState,
+    locale: uiLocale,
+    activeSessionId: activeId,
+    showOnboardingHero,
+  });
   const onboardingComposerHidden = isOnboardingLoading || (showOnboardingHero && onboardingState !== undefined);
   // #1629: hiding the composer because the boundary is unknown is right, but
   // hiding it silently and forever is not. Once the read has spent its retries
@@ -1303,31 +1315,43 @@ function AppShellContent({
     openWorkbarLauncher('right');
   }, [openWorkbarLauncher, setWorkbarCollapsed]);
 
-  const openSideConversation = useCallback((initialPrompt?: string) => {
-    const sourceSessionId = activeIdRef.current;
-    if (!sourceSessionId) return;
-    const panel = openCompanionPanel(null, {
-      sourceSessionId,
-      initialPrompt,
-      newId: () => crypto.randomUUID(),
-    });
-    setQuotePanels((current) => [...current, panel]);
-    setSideChatPreparingPanelIds((current) => new Set(current).add(panel.id));
-    openDynamicWorkbarTab({
-      id: `side-chat:${panel.id}`,
-      kind: 'side-chat',
-      title: sideChatTitleFromPrompt(initialPrompt ?? ''),
-      ordinal: nextSideChatOrdinal([
-        ...workbarPanelsState.right.tabs,
-        ...workbarPanelsState.bottom.tabs,
-      ]),
-    });
-    setWorkbarCollapsed(false);
-  }, [
-    openDynamicWorkbarTab,
-    setWorkbarCollapsed,
-    workbarPanelsState,
-  ]);
+  const openNewSideConversation = useCallback(
+    (placement: SessionWorkbarPlacement, initialPrompt?: string) => {
+      const sourceSessionId = activeIdRef.current;
+      if (!sourceSessionId) return;
+      const panel = openCompanionPanel(null, {
+        sourceSessionId,
+        initialPrompt,
+        newId: () => crypto.randomUUID(),
+      });
+      sideConversations.upsertPanel(panel, true);
+      openDynamicWorkbarTab(
+        {
+          id: `side-chat:${panel.id}`,
+          kind: 'side-chat',
+          title: sideChatTitleFromPrompt(initialPrompt ?? ''),
+          ordinal: nextSideChatOrdinal([
+            ...workbarPanelsState.right.tabs,
+            ...workbarPanelsState.bottom.tabs,
+          ]),
+        },
+        placement,
+      );
+      if (placement === 'right') setWorkbarCollapsed(false);
+      else setBottomPanelOpen(true);
+    },
+    [
+      openDynamicWorkbarTab,
+      setBottomPanelOpen,
+      setWorkbarCollapsed,
+      sideConversations,
+      workbarPanelsState,
+    ],
+  );
+  const openSideConversation = useCallback(
+    (initialPrompt?: string) => openNewSideConversation('right', initialPrompt),
+    [openNewSideConversation],
+  );
   const openSideConversationRef = useRef(openSideConversation);
   openSideConversationRef.current = openSideConversation;
   const sideChatSlashCommands = useMemo<
@@ -1415,14 +1439,7 @@ function AppShellContent({
           newId: () => crypto.randomUUID(),
         },
       );
-      setQuotePanels((current) =>
-        activePanel
-          ? current.map((candidate) => (candidate.id === panel.id ? panel : candidate))
-          : [...current, panel],
-      );
-      if (!activePanel) {
-        setSideChatPreparingPanelIds((current) => new Set(current).add(panel.id));
-      }
+      sideConversations.upsertPanel(panel, !activePanel);
       const targetPlacement =
         activeSideChat?.placement ?? 'right';
       openDynamicWorkbarTab(
@@ -1447,6 +1464,7 @@ function AppShellContent({
       quotePanels,
       setBottomPanelOpen,
       setWorkbarCollapsed,
+      sideConversations,
       workbarPanelsState,
     ],
   );
@@ -1490,26 +1508,7 @@ function AppShellContent({
         return;
       }
       if (kind === 'side-chat') {
-        if (!activeId) return;
-        const panel = openCompanionPanel(null, {
-          sourceSessionId: activeId,
-          newId: () => crypto.randomUUID(),
-        });
-        setQuotePanels((current) => [...current, panel]);
-        setSideChatPreparingPanelIds((current) => new Set(current).add(panel.id));
-        openDynamicWorkbarTab(
-          {
-            id: `side-chat:${panel.id}`,
-            kind: 'side-chat',
-            ordinal: nextSideChatOrdinal([
-              ...workbarPanelsState.right.tabs,
-              ...workbarPanelsState.bottom.tabs,
-            ]),
-          },
-          placement,
-        );
-        if (placement === 'right') setWorkbarCollapsed(false);
-        else setBottomPanelOpen(true);
+        openNewSideConversation(placement);
         return;
       }
       openWorkbarTab(kind, placement);
@@ -1519,6 +1518,7 @@ function AppShellContent({
     [
       activeId,
       openDynamicWorkbarTab,
+      openNewSideConversation,
       openWorkbarTab,
       setBottomPanelOpen,
       setWorkbarCollapsed,
@@ -1549,29 +1549,9 @@ function AppShellContent({
           .map((tab) => tab.id.slice('side-chat:'.length)),
       );
       if (panelIds.size === 0) return;
-      setQuotePanels((current) =>
-        current.filter((panel) => !panelIds.has(panel.id)),
-      );
-      setSideChatContentPanelIds((current) => {
-        const next = new Set(
-          [...current].filter((panelId) => !panelIds.has(panelId)),
-        );
-        return next.size === current.size ? current : next;
-      });
-      setSideChatPreparingPanelIds((current) => {
-        const next = new Set(
-          [...current].filter((panelId) => !panelIds.has(panelId)),
-        );
-        return next.size === current.size ? current : next;
-      });
-      setSideChatActivePanelIds((current) => {
-        const next = new Set(
-          [...current].filter((panelId) => !panelIds.has(panelId)),
-        );
-        return next.size === current.size ? current : next;
-      });
+      sideConversations.removePanels(panelIds);
     },
-    [closeWorkbarTabs],
+    [closeWorkbarTabs, sideConversations],
   );
 
   useEffect(() => {
@@ -1663,22 +1643,8 @@ function AppShellContent({
         : 'bottom';
       closeWorkbarTab(placement, tabId);
     }
-    setQuotePanels((current) =>
-      current.filter((panel) => !staleIds.has(panel.id)),
-    );
-    setSideChatContentPanelIds((current) => {
-      const next = new Set([...current].filter((panelId) => !staleIds.has(panelId)));
-      return next.size === current.size ? current : next;
-    });
-    setSideChatPreparingPanelIds((current) => {
-      const next = new Set([...current].filter((panelId) => !staleIds.has(panelId)));
-      return next.size === current.size ? current : next;
-    });
-    setSideChatActivePanelIds((current) => {
-      const next = new Set([...current].filter((panelId) => !staleIds.has(panelId)));
-      return next.size === current.size ? current : next;
-    });
-  }, [quotePanels, activeId, closeWorkbarTab, workbarPanelsState]);
+    sideConversations.removePanels(staleIds);
+  }, [quotePanels, activeId, closeWorkbarTab, sideConversations, workbarPanelsState]);
 
   function isAutomationsSurfaceActive(): boolean {
     return navSelectionRef.current.section === 'automations' && navSelectionRef.current.module === 'plan-reminders';
@@ -2181,7 +2147,7 @@ function AppShellContent({
     return () => window.clearTimeout(timer);
   }, [activeId, activeStreamingMessageId, messages, settleAssistantStreaming]);
 
-  const hasModalOpen = helpOpen || paletteOpen || searchModalOpen;
+  const hasModalOpen = helpOpen || paletteOpen || searchModalOpen || externalImportOpen;
 
   useEffect(() => {
     const handleWorkbarShortcut = (event: KeyboardEvent) => {
@@ -2620,6 +2586,7 @@ function AppShellContent({
             updateReminder={updateReminder}
             onOpenUpdate={openUpdateDownload}
             onNew={createSession}
+            onImport={() => setExternalImportOpen(true)}
             rowActions={sessionRowActions}
             projectActions={projectRowActions}
           />
@@ -2809,6 +2776,9 @@ function AppShellContent({
                   onNewChatThinkingLevelChange={(level) => setPendingNewChatThinkingLevel(level ?? null)}
                   onOpenModelSettings={() => openSettingsSection('models')}
                   noModelConnection={connections.length === 0}
+                  sendBlocked={
+                    Boolean(workspaceReadinessRecovery) || sessionHealthNotice?.tone === 'destructive'
+                  }
                   permissionMode={activePermissionMode}
                   permissionModePending={activeId ? pendingPermissionModeBySession[activeId] === true : false}
                   // Every "cannot change this mid-turn" gate reads `turnActive`,
@@ -2987,6 +2957,7 @@ function AppShellContent({
                   });
                 }}
                 sessionHealthNotice={sessionHealthNotice}
+                workspaceReadinessRecovery={workspaceReadinessRecovery}
                 showOnboardingHero={showOnboardingHero}
                 onboardingState={onboardingState}
                 isOnboardingLoading={isOnboardingLoading}
@@ -3051,51 +3022,23 @@ function AppShellContent({
                   (panel) => panel.sourceSessionId === activeId,
                 )}
                 onQuotesConsumed={(snapshot) =>
-                  setQuotePanels((current) =>
-                    current.map((panel) =>
-                      panel.id === snapshot.panelId
-                        ? consumeCompanionQuoteSnapshot(panel, snapshot) ?? panel
-                        : panel,
-                    ),
+                  sideConversations.updatePanel(snapshot.panelId, (panel) =>
+                    consumeCompanionQuoteSnapshot(panel, snapshot) ?? panel,
                   )
                 }
                 onRemoveQuote={(target) =>
-                  setQuotePanels((current) =>
-                    current.map((panel) =>
-                      panel.id === target.panelId
-                        ? removeStagedCompanionQuote(panel, target) ?? panel
-                        : panel,
-                    ),
+                  sideConversations.updatePanel(target.panelId, (panel) =>
+                    removeStagedCompanionQuote(panel, target) ?? panel,
                   )
                 }
                 onForkVisibilityChange={onCompanionForkVisibilityChange}
-                onContentStateChange={(panelId, hasContent) =>
-                  setSideChatContentPanelIds((current) => {
-                    if (current.has(panelId) === hasContent) return current;
-                    const next = new Set(current);
-                    if (hasContent) next.add(panelId);
-                    else next.delete(panelId);
-                    return next;
-                  })
-                }
+                onContentStateChange={sideConversations.setContent}
                 preparingSideChatPanelIds={sideChatPreparingPanelIds}
                 activeSideChatPanelIds={sideChatActivePanelIds}
-                onPreparingStateChange={(panelId, preparing) =>
-                  setSideChatPreparingPanelIds((current) => {
-                    if (current.has(panelId) === preparing) return current;
-                    const next = new Set(current);
-                    if (preparing) next.add(panelId);
-                    else next.delete(panelId);
-                    return next;
-                  })
-                }
+                onPreparingStateChange={sideConversations.setPreparing}
                 onInitialPromptStarted={(panelId) =>
-                  setQuotePanels((current) =>
-                    current.map((panel) =>
-                      panel.id === panelId
-                        ? consumeCompanionInitialPrompt(panel, panelId) ?? panel
-                        : panel,
-                    ),
+                  sideConversations.updatePanel(panelId, (panel) =>
+                    consumeCompanionInitialPrompt(panel, panelId) ?? panel,
                   )
                 }
                 onPromptAccepted={(panelId, prompt) => {
@@ -3104,15 +3047,7 @@ function AppShellContent({
                     titleWorkbarTab(`side-chat:${panelId}`, title);
                   }
                 }}
-                onActivityStateChange={(panelId, active) =>
-                  setSideChatActivePanelIds((current) => {
-                    if (current.has(panelId) === active) return current;
-                    const next = new Set(current);
-                    if (active) next.add(panelId);
-                    else next.delete(panelId);
-                    return next;
-                  })
-                }
+                onActivityStateChange={sideConversations.setActive}
                 sourceSession={activeSessionForView}
                 modelChoices={chatModelChoices}
                 mentionSkills={mentionSkills}
@@ -3194,6 +3129,12 @@ function AppShellContent({
         paletteOpen={paletteOpen}
         closePalette={closePalette}
         commandOptions={commandOptions}
+        externalImportOpen={externalImportOpen}
+        onExternalImportOpenChange={setExternalImportOpen}
+        onExternalSessionImported={(session) => {
+          upsertSessionSummary(session);
+          openSessionInChat(session.id);
+        }}
       />
     </div>
   );

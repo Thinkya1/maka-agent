@@ -27,6 +27,8 @@ export * from './interaction.js';
 export * from './project.js';
 export * from './subagent-workspace.js';
 export * from './pet.js';
+export * from './skill-invocation.js';
+export * from './external-session.js';
 
 // events.ts
 export type {
@@ -42,6 +44,8 @@ export type {
   ToolOutputStream,
   ToolProgressEvent,
   ToolResultEvent,
+  ToolResultPreviewEvent,
+  ToolResultPreviewContent,
   ToolResultContent,
   ShellRunSnapshotResult,
   ShellRunCompactResult,
@@ -110,6 +114,12 @@ export {
   TOOL_OUTPUT_DELTA_MAX_CHARS,
   TOOL_OUTPUT_STREAMS,
 } from './events.js';
+
+// tool-result-preview.ts — live-only open-facts for mid-flight tool UI
+export {
+  decodeToolResultPreviewContent,
+  materializeToolResultPreviewForActivity,
+} from './tool-result-preview.js';
 
 // tool-result-status.ts — tool activity status from a result, or from its absence
 export type {
@@ -268,14 +278,6 @@ export type {
   ToolLedgerTransitionKind,
   ToolLedgerTransitionValidation,
 } from './tool-ledger-scanner.js';
-export {
-  ToolLedgerCorruptionError,
-  ToolLedgerRejectionError,
-  scanToolLedger,
-  validateGenericToolLedgerAppend,
-  validateToolLedgerEventLane,
-  validateToolLedgerTransition,
-} from './tool-ledger-scanner.js';
 export type {
   ToolReconcileObservation,
   ToolReconcileResultFact,
@@ -300,21 +302,7 @@ export type {
   ToolRecoveryEventBundle,
   ToolRecoveryOperationIdentity,
 } from './tool-recovery-bundle.js';
-export {
-  ToolRecoveryBundleValidationError,
-  assertToolRecoveryEventBundle,
-  interpretScannedToolRecovery,
-  validateToolRecoveryEventBundle,
-} from './tool-recovery-bundle.js';
-export {
-  canonicalToolArgsHash,
-  stableJsonStringify,
-  stripUndefinedDeep,
-} from './tool-args-identity.js';
-export {
-  encodeCanonicalRuntimeEvent,
-  type CanonicalRuntimeEventEncoding,
-} from './canonical-runtime-event.js';
+export type { CanonicalRuntimeEventEncoding } from './canonical-runtime-event.js';
 export type {
   ContinuationClaimV1,
   ImmutableRuntimePrefixV1,
@@ -325,16 +313,15 @@ export type {
   RuntimePrefixSegmentV1,
   RuntimeBoundaryDigest,
 } from './runtime-boundary.js';
-export {
-  buildImmutableRuntimePrefix,
-  createRuntimeBoundaryCursor,
-  decodeContinuationClaim,
-  decodeRuntimeBoundaryCursor,
-  decodeRuntimePrefixSegment,
-  digestRuntimeBoundaryManifest,
-  digestRuntimePrefix,
-  runtimePrefixSegment,
-} from './runtime-boundary.js';
+// The following modules are intentionally type-only (or absent) in this
+// browser-consumed barrel: their value implementations depend on node:* (e.g.
+// runtime-boundary.ts and tool-args-identity.ts use node:crypto, tool-
+// ledger-scanner.ts and canonical-runtime-event.ts use node:util), which the
+// renderer cannot evaluate. Runtime code must import their values from the
+// explicit subpaths (`@maka/core/runtime-boundary`, `@maka/core/tool-args-
+// identity`, `@maka/core/tool-ledger-scanner`, `@maka/core/canonical-runtime-
+// event`, `@maka/core/tool-recovery-bundle`) so renderer imports of `@maka/core`
+// never evaluate Node-only modules before React can mount.
 
 // session.ts
 export type {
@@ -936,6 +923,21 @@ export {
   isHealthSignalStatus,
 } from './health.js';
 
+// task-submission-readiness.ts
+export type {
+  DeriveTaskSubmissionReadinessInput,
+  TaskSubmissionCapabilityReadinessInput,
+  TaskSubmissionReadinessBlockerCode,
+  TaskSubmissionReadinessDimension,
+  TaskSubmissionReadinessRepairTarget,
+  TaskSubmissionReadinessSnapshot,
+  TaskSubmissionReadinessState,
+} from './task-submission-readiness.js';
+export {
+  TASK_SUBMISSION_READINESS_STATES,
+  deriveTaskSubmissionReadiness,
+} from './task-submission-readiness.js';
+
 // search.ts (PR-SEARCH-0 + PR-SEARCH-1.5)
 export type {
   SearchError,
@@ -1388,6 +1390,7 @@ export type {
 } from './llm-connections.js';
 export {
   CODEX_SUBSCRIPTION_UNSUPPORTED_CHATGPT_MODELS,
+  OPENCODE_FREE_DEFAULT_ENABLED_MODELS,
   PROVIDER_REGISTRY,
   PROVIDER_DEFAULTS,
   CATALOG_PROVIDER_TYPES,
@@ -1395,6 +1398,7 @@ export {
   READY_PROVIDER_TYPES,
   backendKindOf,
   connectionEnabledModelIds,
+  defaultEnabledModelIdsWhenOmitted,
   deriveConnectionSlug,
   isWiredOAuthProvider,
   reconcileConnectionAfterEnabledModelsChange,
@@ -1465,6 +1469,7 @@ export {
 // connection-error-copy.ts — shared not-ready-connection fix copy
 export {
   describeChatConfigurationReason,
+  NO_REAL_CONNECTION_CODE,
   parseNoRealConnectionError,
 } from './connection-error-copy.js';
 export type { ParsedNoRealConnectionError } from './connection-error-copy.js';
@@ -1509,21 +1514,6 @@ export {
   isOnboardingMilestone,
   sanitizeOnboardingMilestones,
 } from './onboarding.js';
-
-// bootstrap-connections.ts
-export type {
-  BootstrapConnectionSeed,
-  BootstrapEnv,
-} from './bootstrap-connections.js';
-export {
-  OPENCODE_FREE_BOOTSTRAP_VERSION,
-  OPENCODE_FREE_DEFAULT_ENABLED_MODELS,
-  OPENCODE_FREE_DEFAULT_MODEL,
-  OPENCODE_FREE_LEGACY_DEFAULT_MODEL,
-  defaultEnabledModelIdsWhenOmitted,
-  resolveBootstrapConnections,
-  resolveOpenCodeFreeBootstrapMigration,
-} from './bootstrap-connections.js';
 
 // model-catalog.ts
 export type {
