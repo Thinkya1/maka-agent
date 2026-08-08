@@ -60,8 +60,8 @@ test('a relay user declaration remains ahead of runtime and static model facts',
     providerType: 'openai-compatible' as const,
     defaultModel: 'relay-model',
     models: [{ id: 'relay-model', contextWindow: 64_000, inputLimit: 128_000 }],
-    relayModelProfiles: { 'relay-model': { contextWindow: 64_000 } },
+    relayModelProfiles: { 'relay-model': { contextWindow: 32_000 } },
   };
 
-  assert.equal(resolveSelectedModelContextWindow(connection, undefined), 64_000);
+  assert.equal(resolveSelectedModelContextWindow(connection, undefined), 32_000);
 });
