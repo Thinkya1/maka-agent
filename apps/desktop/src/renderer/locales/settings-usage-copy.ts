@@ -12,7 +12,8 @@ export type UsageSettingsCopy = {
     save: string; cancel: string; saving: string; removing: string; formAria: string;
     modelKey: string; modelKeyPlaceholder: string; inputRate: string; outputRate: string;
     cacheReadRate: string; cacheWriteRate: string; invalid: string; loading: string;
-    loadFailed: string; saveFailed: string; deleteFailed: string; saved: string; removed: string;
+    loadFailed: string; retry: string; retrying: string; reconciliationRequired: string;
+    saveFailed: string; deleteFailed: string; saved: string; removed: string;
     removeTitle(modelKey: string): string;
     removeDescription(modelKey: string, effect: 'restore_builtin' | 'become_unpriced'): string;
     sourceBuiltin: string; sourceCustomWithFallback: string; sourceCustomOnly: string;
@@ -45,7 +46,8 @@ const SETTINGS_USAGE_COPY = {
       formAria: '自定义模型定价表单', modelKey: '模型标识', modelKeyPlaceholder: 'provider:model，例如 openai:gpt-4o',
       inputRate: '输入价格 / 1M Token', outputRate: '输出价格 / 1M Token', cacheReadRate: '缓存读取 / 1M Token', cacheWriteRate: '缓存写入 / 1M Token',
       invalid: '请填写模型标识、输入价格和输出价格；价格必须是大于或等于 0 的数字。', loading: '正在加载定价覆盖…',
-      loadFailed: '加载定价覆盖失败', saveFailed: '保存定价覆盖失败', deleteFailed: '删除定价覆盖失败', saved: '定价覆盖已保存', removed: '定价覆盖已删除',
+      loadFailed: '加载定价覆盖失败', retry: '重试加载', retrying: '重试中…', reconciliationRequired: '请重新加载最新定价状态，确认结果后再继续编辑。',
+      saveFailed: '保存定价覆盖失败', deleteFailed: '删除定价覆盖失败', saved: '定价覆盖已保存', removed: '定价覆盖已删除',
       removeTitle: (modelKey) => `删除 ${modelKey} 的定价覆盖？`,
       removeDescription: (modelKey, effect) => effect === 'restore_builtin'
         ? `将删除 ${modelKey} 的 override。之后新激活的模型工作会恢复内置价格；正在运行的工作保持启动时的价格。`
@@ -82,7 +84,8 @@ const SETTINGS_USAGE_COPY = {
       formAria: 'Custom model pricing form', modelKey: 'Model key', modelKeyPlaceholder: 'provider:model, for example openai:gpt-4o',
       inputRate: 'Input / 1M tokens', outputRate: 'Output / 1M tokens', cacheReadRate: 'Cache read / 1M tokens', cacheWriteRate: 'Cache write / 1M tokens',
       invalid: 'Enter a model key, input price, and output price. Prices must be numbers greater than or equal to 0.', loading: 'Loading pricing overrides…',
-      loadFailed: 'Failed to load pricing overrides', saveFailed: 'Failed to save pricing override', deleteFailed: 'Failed to delete pricing override', saved: 'Pricing override saved', removed: 'Pricing override deleted',
+      loadFailed: 'Failed to load pricing overrides', retry: 'Retry pricing load', retrying: 'Retrying…', reconciliationRequired: 'Reload the latest pricing state before continuing to edit.',
+      saveFailed: 'Failed to save pricing override', deleteFailed: 'Failed to delete pricing override', saved: 'Pricing override saved', removed: 'Pricing override deleted',
       removeTitle: (modelKey) => `Delete pricing override for ${modelKey}?`,
       removeDescription: (modelKey, effect) => effect === 'restore_builtin'
         ? `This removes the override for ${modelKey}. New model work will use built-in pricing; running work keeps its start-time pricing.`

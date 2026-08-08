@@ -77,8 +77,8 @@ export function SettingsSurface(props: {
   onOpenDailyReview?(): void;
   onOpenKeyboardHelp?(): void;
   onOpenSession?(sessionId: string): void;
-  /** Host-backed Pricing seam; production wiring lands with the M5 cutover. */
-  pricingPort?: DesktopPricingSettingsPort;
+  /** Host-backed Pricing seam supplied by the production app shell. */
+  pricingPort: DesktopPricingSettingsPort;
 }) {
   const locale = useUiLocale();
   const copy = getSettingsSharedCopy(locale);
@@ -389,7 +389,7 @@ function SettingsPageBody(props: {
   section: SettingsSection;
   settings: AppSettings;
   usageStats: UsageStats | null;
-  pricingPort?: DesktopPricingSettingsPort;
+  pricingPort: DesktopPricingSettingsPort;
   connections: LlmConnection[];
   defaultSlug: string | null;
   themePref: ThemePreference;

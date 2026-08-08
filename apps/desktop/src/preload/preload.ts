@@ -108,6 +108,11 @@ import type { TestProxyInput } from '@maka/core/settings/network-settings';
 import type { Result } from '@maka/core/result';
 import type { CreateSessionRequestInput } from '@maka/core';
 import type {
+  DesktopPricingMutationInput,
+  DesktopPricingMutationOutcome,
+  DesktopPricingSnapshot,
+} from '../shared/runtime-host-pricing.js';
+import type {
   McpConfigFile,
   McpServerConfig,
   McpServerStatus,
@@ -828,6 +833,14 @@ const makaBridge = {
     },
     usageStats(range?: UsageRange): Promise<UsageStats> {
       return ipcRenderer.invoke('settings:usageStats', range);
+    },
+    pricing: {
+      loadSnapshot(): Promise<DesktopPricingSnapshot> {
+        return ipcRenderer.invoke('settings:pricing:load');
+      },
+      applyMutation(input: DesktopPricingMutationInput): Promise<DesktopPricingMutationOutcome> {
+        return ipcRenderer.invoke('settings:pricing:mutate', input);
+      },
     },
     bots: {
       listStatuses(): Promise<Record<BotProvider, BotStatus>> {

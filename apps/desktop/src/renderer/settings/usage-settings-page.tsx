@@ -44,11 +44,15 @@ import { SettingsPage } from './settings-section';
 import { useActionGuard } from './use-action-guard';
 import { useOptimisticSettingsDraft } from './use-optimistic-settings-draft';
 import type {
+  DesktopPricingMutationOutcome,
   DesktopPricingSettingsPort,
   DesktopPricingSnapshot,
 } from '../../shared/runtime-host-pricing';
 
 type UsageActiveTab = AppSettings['usage']['activeTab'];
+type PricingIssue =
+  | { kind: 'load_failed'; detail: string }
+  | { kind: 'saved_refresh_failed' | 'reconciliation_unavailable'; detail: string };
 
 export function UsageSettingsPage(props: {
   settings: AppSettings;
@@ -78,6 +82,7 @@ export function UsageSettingsPage(props: {
   const [pricingSnapshot, setPricingSnapshot] = useState<DesktopPricingSnapshot | null>(null);
   const pricingSnapshotRef = useRef<DesktopPricingSnapshot | null>(null);
   const [pricingLoading, setPricingLoading] = useState(true);
+  const [pricingIssue, setPricingIssue] = useState<PricingIssue | null>(null);
   const pricingReloadTicketRef = useRef(0);
 
   function replacePricingSnapshot(next: DesktopPricingSnapshot | null) {
@@ -92,6 +97,7 @@ export function UsageSettingsPage(props: {
     if (!props.pricingPort) {
       if (usagePageMountedRef.current && ticket === pricingReloadTicketRef.current) {
         replacePricingSnapshot(null);
+        setPricingIssue({ kind: 'load_failed', detail: copy.pricing.unavailable });
         setPricingLoading(false);
       }
       return;
@@ -100,17 +106,21 @@ export function UsageSettingsPage(props: {
       const next = await props.pricingPort.loadPricingSnapshot();
       if (usagePageMountedRef.current && ticket === pricingReloadTicketRef.current) {
         replacePricingSnapshot(next);
+        setPricingIssue(null);
       }
     } catch (error) {
       if (usagePageMountedRef.current && ticket === pricingReloadTicketRef.current) {
-        toast.error(copy.pricing.loadFailed, settingsActionErrorMessage(error, locale));
+        setPricingIssue({
+          kind: 'load_failed',
+          detail: settingsActionErrorMessage(error, locale),
+        });
       }
     } finally {
       if (usagePageMountedRef.current && ticket === pricingReloadTicketRef.current) {
         setPricingLoading(false);
       }
     }
-  }, [copy.pricing.loadFailed, locale, props.pricingPort, toast, usagePageMountedRef]);
+  }, [copy.pricing.unavailable, locale, props.pricingPort, usagePageMountedRef]);
 
   const normalizedModelFilter = usageDraft.modelFilter.trim().toLowerCase();
   const hasRequestFilters = usageDraft.status !== 'all' || normalizedModelFilter.length > 0;
@@ -148,7 +158,10 @@ export function UsageSettingsPage(props: {
     if (!usageRefreshGuard.begin('refresh')) return;
     setRefreshing(true);
     try {
-      await props.onReload(usageDraftRef.current.range);
+      await Promise.all([
+        props.onReload(usageDraftRef.current.range),
+        reloadPricingSnapshot(),
+      ]);
     } finally {
       usageRefreshGuard.finish();
       if (usagePageMountedRef.current) {
@@ -166,30 +179,42 @@ export function UsageSettingsPage(props: {
   }, [reloadPricingSnapshot]);
 
   async function putPricingOverride(pricing: PricingConfig) {
-    await applyPricingMutation({ kind: 'upsert', pricing });
+    return applyPricingMutation({ kind: 'upsert', pricing });
   }
 
   async function resetPricingOverride(entry: EffectivePricingEntry) {
-    await applyPricingMutation({ kind: 'delete', modelKey: entry.pricing.modelKey });
+    return applyPricingMutation({ kind: 'delete', modelKey: entry.pricing.modelKey });
   }
 
-  async function applyPricingMutation(mutation: PricingMutation) {
+  async function applyPricingMutation(
+    mutation: PricingMutation,
+  ): Promise<DesktopPricingMutationOutcome> {
     const port = props.pricingPort;
     const base = pricingSnapshotRef.current;
     if (!port || !base) throw new Error(copy.pricing.unavailable);
     const outcome = await port.applyPricingMutation({ base, mutation });
     if (outcome.kind === 'saved' || outcome.kind === 'synchronized') {
       replacePricingSnapshot(outcome.snapshot);
-      return;
+      setPricingIssue(null);
+      return outcome;
     }
     if (outcome.kind === 'review_required') {
       replacePricingSnapshot(outcome.snapshot);
-      throw new Error(copy.pricing.reviewRequired);
+      setPricingIssue(null);
+      return outcome;
     }
     if (outcome.kind === 'saved_refresh_failed') {
-      throw new Error(copy.pricing.savedRefreshFailed);
+      setPricingIssue({
+        kind: 'saved_refresh_failed',
+        detail: copy.pricing.reconciliationRequired,
+      });
+      return outcome;
     }
-    throw new Error(copy.pricing.outcomeUnknown);
+    setPricingIssue({
+      kind: 'reconciliation_unavailable',
+      detail: copy.pricing.reconciliationRequired,
+    });
+    return outcome;
   }
 
   return (
@@ -295,9 +320,12 @@ export function UsageSettingsPage(props: {
               <UsagePricingPanel
                 entries={pricingSnapshot?.entries ?? []}
                 isLoading={pricingLoading}
+                isReady={Boolean(pricingSnapshot) && !pricingIssue && !pricingLoading}
+                pricingIssue={pricingIssue}
                 copy={copy}
                 onPut={putPricingOverride}
                 onReset={resetPricingOverride}
+                onReloadPricing={reloadPricingSnapshot}
               />
             ) : (
               <UsagePricingUnavailablePanel copy={copy} />
@@ -543,9 +571,12 @@ function formatPricingRate(rate: number | undefined, empty: string): string {
 function UsagePricingPanel(props: {
   entries: readonly EffectivePricingEntry[];
   isLoading: boolean;
+  isReady: boolean;
+  pricingIssue: PricingIssue | null;
   copy: UsageSettingsCopy;
-  onPut(pricing: PricingConfig): Promise<void>;
-  onReset(entry: EffectivePricingEntry): Promise<void>;
+  onPut(pricing: PricingConfig): Promise<DesktopPricingMutationOutcome>;
+  onReset(entry: EffectivePricingEntry): Promise<DesktopPricingMutationOutcome>;
+  onReloadPricing(): Promise<void>;
 }) {
   const locale = useUiLocale();
   const toast = useToast();
@@ -555,11 +586,13 @@ function UsagePricingPanel(props: {
   const [busy, setBusy] = useState(false);
 
   function openAddForm() {
+    if (!props.isReady) return;
     setFormError(null);
     setDraft(emptyPricingDraft());
   }
 
   function openEditForm(entry: EffectivePricingEntry) {
+    if (!props.isReady) return;
     setFormError(null);
     setDraft(pricingDraftFromEntry(entry));
   }
@@ -573,7 +606,7 @@ function UsagePricingPanel(props: {
 
   async function savePricing(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!draft || !pricingActionGuard.begin('put')) return;
+    if (!draft || !props.isReady || !pricingActionGuard.begin('put')) return;
     const pricing = pricingConfigFromDraft(draft);
     if (!pricing) {
       setFormError(props.copy.pricing.invalid);
@@ -582,12 +615,26 @@ function UsagePricingPanel(props: {
     }
     setBusy(true);
     try {
-      await props.onPut(pricing);
-      if (draft) {
+      const outcome = await props.onPut(pricing);
+      if (outcome.kind === 'saved' || outcome.kind === 'synchronized') {
         setDraft(null);
         setFormError(null);
+        toast.success(props.copy.pricing.saved);
+      } else if (outcome.kind === 'review_required') {
+        setDraft(null);
+        setFormError(null);
+        toast.warning(props.copy.pricing.reviewRequired);
+      } else if (outcome.kind === 'saved_refresh_failed') {
+        toast.warning(
+          props.copy.pricing.savedRefreshFailed,
+          props.copy.pricing.reconciliationRequired,
+        );
+      } else {
+        toast.warning(
+          props.copy.pricing.outcomeUnknown,
+          props.copy.pricing.reconciliationRequired,
+        );
       }
-      toast.success(props.copy.pricing.saved);
     } catch (error) {
       toast.error(props.copy.pricing.saveFailed, settingsActionErrorMessage(error, locale));
     } finally {
@@ -597,7 +644,7 @@ function UsagePricingPanel(props: {
   }
 
   async function removePricing(entry: EffectivePricingEntry) {
-    if (entry.source !== 'custom') return;
+    if (entry.source !== 'custom' || !props.isReady) return;
     const modelKey = entry.pricing.modelKey;
     const resetEffect = entry.resetEffect;
     if (!pricingActionGuard.begin('reset')) return;
@@ -610,13 +657,29 @@ function UsagePricingPanel(props: {
         cancelLabel: props.copy.pricing.cancel,
         destructive: true,
       });
-      if (!confirmed) return;
-      await props.onReset(entry);
-      if (draft?.originalModelKey === modelKey) {
+      if (!confirmed || !props.isReady) return;
+      const outcome = await props.onReset(entry);
+      if (outcome.kind === 'saved' || outcome.kind === 'synchronized') {
+        if (draft?.originalModelKey === modelKey) {
+          setDraft(null);
+          setFormError(null);
+        }
+        toast.success(props.copy.pricing.removed);
+      } else if (outcome.kind === 'review_required') {
         setDraft(null);
         setFormError(null);
+        toast.warning(props.copy.pricing.reviewRequired);
+      } else if (outcome.kind === 'saved_refresh_failed') {
+        toast.warning(
+          props.copy.pricing.savedRefreshFailed,
+          props.copy.pricing.reconciliationRequired,
+        );
+      } else {
+        toast.warning(
+          props.copy.pricing.outcomeUnknown,
+          props.copy.pricing.reconciliationRequired,
+        );
       }
-      toast.success(props.copy.pricing.removed);
     } catch (error) {
       toast.error(props.copy.pricing.deleteFailed, settingsActionErrorMessage(error, locale));
     } finally {
@@ -625,7 +688,12 @@ function UsagePricingPanel(props: {
     }
   }
 
-  const controlsDisabled = busy || props.isLoading;
+  const controlsDisabled = busy || props.isLoading || !props.isReady;
+  const pricingIssueTitle = props.pricingIssue?.kind === 'load_failed'
+    ? props.copy.pricing.loadFailed
+    : props.pricingIssue?.kind === 'saved_refresh_failed'
+      ? props.copy.pricing.savedRefreshFailed
+      : props.copy.pricing.outcomeUnknown;
   return (
     <>
       <div className="settingsUsagePricingHeader">
@@ -643,6 +711,24 @@ function UsagePricingPanel(props: {
         />
       </div>
 
+      {props.pricingIssue ? (
+        <Banner
+          status={props.pricingIssue.kind === 'load_failed' ? 'error' : 'warning'}
+          title={pricingIssueTitle}
+          description={props.pricingIssue.detail}
+          endContent={(
+            <Button
+              variant="ghost"
+              size="sm"
+              isDisabled={props.isLoading}
+              aria-busy={props.isLoading}
+              onClick={() => void props.onReloadPricing()}
+              label={props.isLoading ? props.copy.pricing.retrying : props.copy.pricing.retry}
+            />
+          )}
+        />
+      ) : null}
+
       {draft ? (
         <form
           className="settingsUsagePricingForm"
@@ -657,7 +743,7 @@ function UsagePricingPanel(props: {
               placeholder={props.copy.pricing.modelKeyPlaceholder}
               label={props.copy.pricing.modelKey}
               isRequired
-              isDisabled={busy || draft.originalModelKey !== null}
+              isDisabled={controlsDisabled || draft.originalModelKey !== null}
               width="100%"
             />
             <div className="settingsUsagePricingRateFields">
@@ -668,7 +754,7 @@ function UsagePricingPanel(props: {
                 step={0.000001}
                 hasClear
                 isRequired
-                isDisabled={busy}
+                isDisabled={controlsDisabled}
                 onChange={(inputUsdPer1M) => setDraft((current) => current ? { ...current, inputUsdPer1M } : current)}
               />
               <NumberInput
@@ -678,7 +764,7 @@ function UsagePricingPanel(props: {
                 step={0.000001}
                 hasClear
                 isRequired
-                isDisabled={busy}
+                isDisabled={controlsDisabled}
                 onChange={(outputUsdPer1M) => setDraft((current) => current ? { ...current, outputUsdPer1M } : current)}
               />
               <NumberInput
@@ -688,7 +774,7 @@ function UsagePricingPanel(props: {
                 step={0.000001}
                 hasClear
                 isOptional
-                isDisabled={busy}
+                isDisabled={controlsDisabled}
                 onChange={(cacheReadUsdPer1M) => setDraft((current) => current ? { ...current, cacheReadUsdPer1M } : current)}
               />
               <NumberInput
@@ -698,7 +784,7 @@ function UsagePricingPanel(props: {
                 step={0.000001}
                 hasClear
                 isOptional
-                isDisabled={busy}
+                isDisabled={controlsDisabled}
                 onChange={(cacheWriteUsdPer1M) => setDraft((current) => current ? { ...current, cacheWriteUsdPer1M } : current)}
               />
             </div>
@@ -710,7 +796,7 @@ function UsagePricingPanel(props: {
               type="submit"
               variant="primary"
               size="sm"
-              isDisabled={busy}
+              isDisabled={controlsDisabled}
               aria-busy={busy}
               data-pending={busy ? 'true' : undefined}
               label={busy ? props.copy.pricing.saving : props.copy.pricing.save}
