@@ -126,6 +126,10 @@ const DYNAMIC_STYLE_HOOKS = new Set([
   // Rendered by Astryx's own Collapsible; settings/permission.css targets it to
   // size the capability group's disclosure row.
   'astryx-collapsible-trigger',
+  // ChatComposerDrawer's root (themeProps). composer.css pins its content
+  // grid's implicit column to the grid's own width so the staged-attachment
+  // row wraps at the real drawer edge instead of a max-content phantom width.
+  'astryx-chat-composer-drawer',
   // Astryx's Item (themeProps class on every settings row). rows.css squares
   // its corners inside an open row group: Item ships a 10px radius for its
   // standalone chip use, and our hairline is a border on the Item itself, so
@@ -135,6 +139,12 @@ const DYNAMIC_STYLE_HOOKS = new Set([
   // composer-mention.css caps its width: upstream sets a 180px floor and no
   // ceiling, and our rows carry a non-wrapping second line.
   'astryx-trigger-menu',
+  // Workbar Review and Terminal surfaces style Astryx components by their
+  // stable runtime themeProps classes.
+  'astryx-banner',
+  'astryx-toolbar',
+  // xterm.js creates the viewport node internally after mounting.
+  'xterm-viewport',
   // Appearance palette swatches — composed at runtime via
   // `settingsPaletteSwatch-${palette}` in settings/appearance-settings-page.tsx
   // (#308), so the per-palette variants never appear as string literals in
@@ -156,6 +166,16 @@ const DYNAMIC_STYLE_HOOKS = new Set([
   // literals. Keep in sync with the density prop's values.
   'maka-markdown-code-default',
   'maka-markdown-code-compact',
+  // Astryx's Markdown renders its document root and every block through
+  // themeProps, so these classes exist only at runtime. The transcript rhythm
+  // table in packages/ui/src/styles.css targets them (with `data-density`) to
+  // own compact prose spacing, which Astryx's density cannot reach on its own.
+  'astryx-markdown',
+  'astryx-markdown-heading',
+  // Markdown delegates lists to the List control; the rhythm table re-spaces
+  // its rows as prose.
+  'astryx-list',
+  'astryx-list-item',
 ]);
 
 /**
@@ -193,6 +213,16 @@ const RESERVED_SCALE_TOKENS = new Set([
   // dead shell recipes (#1980), but deleting the named curve is what invites
   // the next bare cubic-bezier.
   '--ease-in-out-strong',
+  // Accent lightness ladder — --action (L0.85 chip), --control (L0.65, the
+  // rung tuned for WCAG 1.4.11 non-text 3:1) and --accent-solid (L0.52, the
+  // lowest that clears 1.4.3 for text). The middle rung lost its last
+  // consumer when the sidebar update chip became an Astryx IconButton and
+  // stopped hand-painting an accent background; the ladder, and the contrast
+  // derivation recorded against each rung in maka-tokens.css, only reads as a
+  // series with it present. --control-foreground is its paired foreground,
+  // meaningless apart from it.
+  '--control',
+  '--control-foreground',
 ]);
 
 async function readCssFiles(dir) {

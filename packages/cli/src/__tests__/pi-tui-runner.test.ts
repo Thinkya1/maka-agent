@@ -29,6 +29,7 @@ import {
 import type {
   MakaPreparePromptOptions,
   MakaPreparedSessionTurn,
+  MakaAttachedSessionTurn,
   MakaSessionMoveResult,
   MakaSessionDriver,
   MakaSessionRewindResult,
@@ -37,20 +38,17 @@ import type {
   SessionResumeAvailability,
 } from '../session-driver.js';
 import { CliGoalContinuation, type CliGoalTurnHost } from '../cli-goal-continuation.js';
-import type { ModelChoice } from '../connection-target.js';
-import {
-  listApiKeyOnboardableProviders,
-  type MakaOnboardingSurface,
-  type OnboardingProviderEntry,
-  type OnboardingSaveResult,
-  type OnboardingVerifyResult,
-} from '../onboarding.js';
+import { listApiKeyOnboardableProviders } from '../onboarding-catalog.js';
+import type {
+  MakaOnboardingSurface,
+  MakaPiTuiGoalLifecycle,
+  ModelChoice,
+  OnboardingProviderEntry,
+  OnboardingSaveResult,
+  OnboardingVerifyResult,
+} from '../pi-tui-contracts.js';
 import type { ModelInfo, ProviderType } from '@maka/core/llm-connections';
-import {
-  runMakaPiTui as runMakaPiTuiImpl,
-  type MakaPiTuiGoalLifecycle,
-  type MakaPiTuiInput,
-} from '../pi-tui-runner.js';
+import { runMakaPiTui as runMakaPiTuiImpl, type MakaPiTuiInput } from '../pi-tui-runner.js';
 import { AUTO_RECAP_IDLE_MS } from '../session-recap.js';
 import { _setColorLevelForTesting } from '../tui-ansi.js';
 import { BUSY_SPINNER_FRAMES } from '../tui-attention.js';
@@ -60,8 +58,16 @@ import {
   inputSurfaceRows,
   latestPlainLineContaining,
   plainTerminalOutput,
+  WAIT_BUDGET_MS,
   waitFor,
+  waitForTuiPaint,
 } from './tui-terminal-mock.js';
+
+// Deadline for `Promise.race([run, …])` close watchdogs. A passing race
+// resolves the moment `run` settles, so this only bounds how long a FAILING
+// close takes to report — the same budget split as waitFor's WAIT_BUDGET_MS
+// (tight locally, generous on loaded CI runners).
+const CLOSE_BUDGET_MS = Math.max(WAIT_BUDGET_MS, 500);
 
 // Pin truecolor so the accent-chrome escape assertion ("uses logo blue") is
 // hermetic. Color level is detected from process.env.TERM/COLORTERM at module
@@ -213,7 +219,7 @@ describe('Maka Pi TUI runner', () => {
 
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -294,7 +300,7 @@ describe('Maka Pi TUI runner', () => {
       }),
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/setup');
     terminal.input('\r');
     await waitFor(() => {
@@ -332,7 +338,7 @@ describe('Maka Pi TUI runner', () => {
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -358,7 +364,7 @@ describe('Maka Pi TUI runner', () => {
       }),
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/setup');
     terminal.input('\r');
     await waitFor(() => {
@@ -380,16 +386,24 @@ describe('Maka Pi TUI runner', () => {
     // as the API key (otherwise /exit, /model, etc. become persisted secrets).
     terminal.input('/setup');
     terminal.input('\r');
-    await delay(60);
-    assert.equal(verifyCalls.length, 0);
+    // The wizard restarts at the provider step (closeWizard + re-route): the
+    // key field leaving the screen is the observable proof the input line was
+    // routed as a command instead of being consumed as key text.
+    await waitFor(() => {
+      const screen = plainTerminalOutput(terminal.screenOutput());
+      return screen.includes('Set Up Provider') && !screen.includes('API key');
+    });
 
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
+    // Anchored after close: every queued input has been fully processed, so a
+    // swallowed-as-key submit would have surfaced in verifyCalls by now.
+    assert.equal(verifyCalls.length, 0);
   });
 
   test('/setup without an onboarding surface reports unavailable in-frame instead of throwing', async () => {
@@ -407,7 +421,7 @@ describe('Maka Pi TUI runner', () => {
       terminal,
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/setup');
     terminal.input('\r');
     await waitFor(() => {
@@ -438,7 +452,7 @@ describe('Maka Pi TUI runner', () => {
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -464,18 +478,21 @@ describe('Maka Pi TUI runner', () => {
       },
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/setup');
     terminal.input('\r');
-    await delay(60);
-    const out = plainTerminalOutput(terminal.screenOutput());
-    assert.match(out, /storage read failed/);
-    assert.doesNotMatch(out, /没有可配置的 API key 类供应商/);
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('storage read failed'),
+    );
+    assert.doesNotMatch(
+      plainTerminalOutput(terminal.screenOutput()),
+      /没有可配置的 API key 类供应商/,
+    );
 
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -508,7 +525,7 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('\x1b');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close on first-run picker cancel');
       }),
     ]);
@@ -540,7 +557,7 @@ describe('Maka Pi TUI runner', () => {
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -577,7 +594,7 @@ describe('Maka Pi TUI runner', () => {
       }),
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/setup');
     terminal.input('\r');
     await waitFor(() => {
@@ -605,7 +622,9 @@ describe('Maka Pi TUI runner', () => {
     await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('已启用 1 个模型'));
     assert.doesNotMatch(plainTerminalOutput(terminal.screenOutput()), /已配置/);
     terminal.input('\r'); // close the in-frame success
-    await delay(40);
+    // The success frame leaving the screen proves the wizard overlay released
+    // input focus, so the next line routes to the editor.
+    await waitFor(() => !plainTerminalOutput(terminal.screenOutput()).includes('已启用 1 个模型'));
     // The refreshed ready model choices are immediately available from /model.
     terminal.input('/model');
     terminal.input('\r');
@@ -616,7 +635,7 @@ describe('Maka Pi TUI runner', () => {
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -668,7 +687,7 @@ describe('Maka Pi TUI runner', () => {
     // host re-resolves the now-configured default connection and relaunches.
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('first-run TUI did not close after save');
       }),
     ]);
@@ -699,7 +718,7 @@ describe('Maka Pi TUI runner', () => {
       }),
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/setup');
     terminal.input('\r');
     await waitFor(() => {
@@ -751,16 +770,18 @@ describe('Maka Pi TUI runner', () => {
     // A's verify now resolves with a failure. It must not clobber attempt B:
     // no failure status line, and the key being typed for B survives.
     resolveFirst({ kind: 'error', text: 'HTTP 401 Unauthorized' });
-    await delay(40);
+    // Sentinel render: one more typed key char forces a full repaint that lands
+    // after A's settled continuation, so a wrongly-applied failure line would be
+    // in this exact frame.
+    terminal.input('x');
+    await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('sk-bx'));
 
-    const out = plainTerminalOutput(terminal.screenOutput());
-    assert.doesNotMatch(out, /验证失败/);
-    assert.ok(out.includes('sk-b'));
+    assert.doesNotMatch(plainTerminalOutput(terminal.screenOutput()), /验证失败/);
 
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -791,7 +812,7 @@ describe('Maka Pi TUI runner', () => {
       }),
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/setup');
     terminal.input('\r');
     await waitFor(() => {
@@ -833,13 +854,17 @@ describe('Maka Pi TUI runner', () => {
     });
     // A's save now resolves ok. It must not show success or refresh choices.
     resolveFirstSave({ kind: 'ok', modelChoices: [] });
-    await delay(40);
+    // Sentinel render: typing into the key field forces a repaint that lands
+    // after A's settled save continuation, so a wrongly-shown success frame
+    // would be in this exact frame.
+    terminal.input('sk-z');
+    await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('sk-z'));
     assert.doesNotMatch(plainTerminalOutput(terminal.screenOutput()), /已启用/);
 
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -868,7 +893,7 @@ describe('Maka Pi TUI runner', () => {
       }),
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/setup');
     terminal.input('\r');
     await waitFor(() => {
@@ -902,7 +927,9 @@ describe('Maka Pi TUI runner', () => {
       }
     });
     terminal.input('\x03'); // Ctrl+C closes the wizard
-    await delay(30);
+    // The wizard frame leaving the screen proves the overlay released input
+    // focus, so the next line routes to the editor.
+    await waitFor(() => !plainTerminalOutput(terminal.screenOutput()).includes('2/3'));
     // The save completes after the user left. The running TUI's ready model
     // choices are still authoritatively refreshed — abandoning the wizard only
     // drops the in-frame success UI, not the background state sync.
@@ -918,7 +945,10 @@ describe('Maka Pi TUI runner', () => {
         },
       ],
     });
-    await delay(40);
+    // The refresh (`modelChoices = result.modelChoices`) lands in the save
+    // promise's first continuation; one macrotask turn runs strictly after
+    // every queued microtask, so the choices are applied by the time it fires.
+    await delay(0);
     terminal.input('/model');
     terminal.input('\r');
     await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('gpt-5.5-new'));
@@ -927,7 +957,7 @@ describe('Maka Pi TUI runner', () => {
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -985,15 +1015,15 @@ describe('Maka Pi TUI runner', () => {
 
     terminal.input('hello');
     terminal.input('\r');
-    await delay(40);
+    // The wizard is back open as the only first-run surface; its frame is the
+    // observable proof the submit was intercepted before reaching the driver.
+    await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('Set Up Provider'));
     assert.equal(preparePromptCalls, 0);
-    // The wizard is back open as the only first-run surface.
-    assert.ok(plainTerminalOutput(terminal.screenOutput()).includes('Set Up Provider'));
 
     process.emit('SIGTERM');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after SIGTERM');
       }),
     ]);
@@ -1035,7 +1065,7 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('\x03');
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('Ctrl+C did not close the first-run wizard from the key phase');
       }),
     ]);
@@ -1060,7 +1090,11 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('\r');
 
     await waitFor(() => driver.boundaryRequests === 1);
-    await delay(20);
+    // The rendered prompt is the observable arming signal: only once it owns
+    // input does 'y' mean allow instead of editor text.
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('Allow access outside the workspace?'),
+    );
     terminal.input('y');
     await waitFor(() => driver.boundaryResponses.length === 1);
 
@@ -1074,7 +1108,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1103,19 +1137,32 @@ describe('Maka Pi TUI runner', () => {
 
     terminal.input('run');
     terminal.input('\r');
-    await delay(20);
+    // The submit clearing the editor is the observable signal the next typed
+    // text starts a fresh draft instead of appending to 'run'.
+    await waitFor(() => {
+      try {
+        return editorInputText(terminal) === '';
+      } catch {
+        return false; // the first frame has not painted an editor yet
+      }
+    });
     terminal.input('keep this draft');
     await waitFor(() => editorInputText(terminal) === 'keep this draft');
     releaseBoundaryRequest();
     await waitFor(() => driver.boundaryRequests === 1);
+    // The rendered prompt is the observable arming signal: only once it owns
+    // input is 'x' a (rejected) decision key instead of editor text.
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('Allow access outside the workspace?'),
+    );
 
     terminal.input('x');
-    await delay(20);
-    assert.equal(editorInputText(terminal), 'keep this draft');
-    assert.deepEqual(driver.boundaryResponses, []);
-
     terminal.input('n');
     await waitFor(() => driver.boundaryResponses.length === 1);
+    // Input is processed in order, so a single deny response proves the armed
+    // prompt ignored 'x': an 'x'-triggered response would either add a second
+    // entry or change the first decision.
+    assert.deepEqual(driver.boundaryResponses, [{ requestId: 'boundary-1', decision: 'deny' }]);
     await waitFor(() => editorInputText(terminal) === 'keep this draft');
 
     exitMaka(terminal);
@@ -1138,14 +1185,17 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('run');
     terminal.input('\r');
     await waitFor(() => driver.boundaryRequests === 1);
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('Allow access outside the workspace?'),
+    );
     terminal.input('\x1b[121;1:2u');
-    await delay(20);
-    assert.deepEqual(driver.boundaryResponses, []);
-
     terminal.input('y');
     await waitFor(() => driver.boundaryResponses.length === 1);
     exitMaka(terminal);
     await run;
+    // After close every queued input has been drained: exactly one allow
+    // response proves the armed prompt ignored the 'y' key-release event.
+    assert.deepEqual(driver.boundaryResponses, [{ requestId: 'boundary-1', decision: 'allow' }]);
   });
 
   test('ignores the removed turn-wide approval key while a boundary request waits', async () => {
@@ -1166,12 +1216,15 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('n');
     terminal.input('\r');
     await waitFor(() => driver.boundaryRequests === 1);
-    await delay(20);
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('Allow access outside the workspace?'),
+    );
     terminal.input('a');
-    await delay(20);
-    assert.equal(driver.boundaryResponses.length, 0);
     terminal.input('y');
     await waitFor(() => driver.boundaryResponses.length === 1);
+    // Input is processed in order, so a single allow response proves the armed
+    // prompt ignored the removed turn-wide 'a' key: an 'a'-triggered response
+    // would either add a second entry or change the first decision.
     assert.deepEqual(driver.boundaryResponses, [
       {
         requestId: 'boundary-1',
@@ -1182,7 +1235,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1207,7 +1260,11 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('\r');
 
     await waitFor(() => driver.boundaryRequests === 1);
-    await delay(20);
+    // The rendered prompt is the observable arming signal: only once it owns
+    // input does 'n' mean deny instead of editor text.
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('Allow access outside the workspace?'),
+    );
     terminal.input('n');
     await waitFor(() => driver.boundaryResponses.length === 1);
 
@@ -1221,7 +1278,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1276,7 +1333,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1373,12 +1430,11 @@ describe('Maka Pi TUI runner', () => {
     await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('Anything else'));
 
     // Q3: ↑ from the first option wraps to the (empty) Other row; Enter there is a
-    // no-op, so the question stays open until Escape leaves it unanswered.
+    // no-op, so the question stays open until Escape leaves it unanswered. Input
+    // is processed in order, so the null third answer below proves the Enter
+    // submitted nothing — a submit would have answered Q3 before the Escape.
     terminal.input('\x1b[A');
     terminal.input('\r');
-    await delay(20);
-    assert.equal(driver.responses.length, 0);
-    assert.ok(plainTerminalOutput(terminal.screenOutput()).includes('Anything else'));
     terminal.input('\x1b');
 
     await waitFor(() => driver.responses.length === 1);
@@ -1546,7 +1602,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1555,6 +1611,10 @@ describe('Maka Pi TUI runner', () => {
   test('off-screen running-Bash ticker never clears scrollback (#1135)', async () => {
     const terminal = new FakeTerminal();
     const driver = new OffscreenTickerDriver();
+    // Drive the 1s elapsed ticker manually instead of waiting wall-clock
+    // seconds: the injected clock advances and the captured callback fires.
+    let fakeNow = 10_000;
+    let tick: (() => void) | undefined;
     const run = runMakaPiTui({
       title: 'Maka',
       driver,
@@ -1563,21 +1623,39 @@ describe('Maka Pi TUI runner', () => {
       connectionSlug: 'claude-subscription',
       permissionMode: 'ask',
       terminal,
+      shellRunTicker: {
+        now: () => fakeNow,
+        schedule: (callback) => {
+          tick = callback;
+          return () => {
+            tick = undefined;
+          };
+        },
+      },
     });
 
     terminal.input('r');
     terminal.input('\r');
     await waitFor(() => plainTerminalOutput(terminal.output()).includes('late-build'));
 
-    // The ticker fires every 1s; wait past two ticks. The early running card
-    // is off-screen, so its elapsed update must not trigger a scrollback wipe.
-    await delay(2_500);
+    // Two elapsed ticks. The early running card is off-screen, so its elapsed
+    // update must not trigger a scrollback wipe.
+    await waitFor(() => tick !== undefined, 'the elapsed ticker to be scheduled');
+    fakeNow += 1_000;
+    tick!();
+    fakeNow += 1_000;
+    tick!();
+    // Sentinel render: the typed char repaints in the same coalesced pass as
+    // the tick-dirtied state, so a wrongful scrollback clear would have been
+    // written by the time it shows.
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal) === 'z');
     assert.equal(terminal.output().includes('\x1b[3J'), false);
 
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1628,14 +1706,18 @@ describe('Maka Pi TUI runner', () => {
         output: pipeOutput('early-build done'),
       },
     });
-    await delay(50);
+    // Sentinel render: the typed char repaints in the same coalesced pass as
+    // the settle-dirtied state, so a wrongful scrollback clear would have been
+    // written by the time it shows.
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal) === 'z');
 
     assert.equal(terminal.output().includes('\x1b[3J'), false);
 
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1665,7 +1747,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1693,7 +1775,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1778,13 +1860,16 @@ describe('Maka Pi TUI runner', () => {
     // The compact-only annotation leaving the screen proves the card is
     // still expanded after the release event.
     await waitFor(() => !plainTerminalOutput(terminal.screenOutput()).includes('(31 lines)'));
-    await delay(20);
+    // Sentinel render ordered after the release event: if the release had
+    // collapsed the card back, this frame would show the annotation again.
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal) === 'z');
     assert.equal(plainTerminalOutput(terminal.screenOutput()).includes('(31 lines)'), false);
 
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1809,9 +1894,13 @@ describe('Maka Pi TUI runner', () => {
 
     // One physical Esc keypress arrives as a press + release pair under the
     // kitty protocol; it must count as a single Escape, not an interrupt.
+    // Escape handling runs synchronously off the input dispatch, so one
+    // macrotask turn (which drains every queued microtask first) is a
+    // deterministic settle — a wrongly-counted double Escape would have
+    // called stopSession by now.
     terminal.input('\x1b[27u');
     terminal.input('\x1b[27;1:3u');
-    await delay(20);
+    await delay(0);
     assert.equal(driver.stopCalls, 0);
 
     // A real second press still interrupts the running turn.
@@ -1822,7 +1911,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -1863,7 +1952,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -2136,7 +2225,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -2158,10 +2247,9 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('unsent draft');
     await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('unsent draft'));
     terminal.input('\x03');
-    await delay(20);
-
+    // The draft leaving the screen is the observable effect of the Ctrl-C.
+    await waitFor(() => !plainTerminalOutput(terminal.screenOutput()).includes('unsent draft'));
     assert.equal(terminal.stopCalls, 0);
-    assert.doesNotMatch(plainTerminalOutput(terminal.screenOutput()), /unsent draft/);
     terminal.input('/exit');
     terminal.input('\r');
     await run;
@@ -2211,8 +2299,12 @@ describe('Maka Pi TUI runner', () => {
     await waitFor(() =>
       plainTerminalOutput(terminal.screenOutput()).includes('Press Ctrl+C again to exit.'),
     );
+    // Ctrl-C counting runs synchronously off the input dispatch, so one
+    // macrotask turn (which drains every queued microtask first) is a
+    // deterministic settle — a wrongly-counted second press would have begun
+    // closing the terminal by now.
     terminal.input('\x1b[99;5:2u');
-    await delay(20);
+    await delay(0);
 
     assert.equal(terminal.stopCalls, 0);
     terminal.input('\x1b[99;5u');
@@ -2235,8 +2327,12 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('run');
     terminal.input('\r');
     await waitFor(() => terminal.progressStates.at(-1) === true);
+    // Ctrl-D handling runs synchronously off the input dispatch, so one
+    // macrotask turn (which drains every queued microtask first) is a
+    // deterministic settle — a wrongly-honored Ctrl-D would have begun
+    // closing the terminal or stopping the turn by now.
     terminal.input('\x04');
-    await delay(20);
+    await delay(0);
 
     assert.equal(terminal.stopCalls, 0);
     assert.equal(driver.stopCalls, 0);
@@ -2535,13 +2631,20 @@ describe('Maka Pi TUI runner', () => {
     await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('a draft to keep'));
 
     terminal.input('\x1b\r'); // Alt+Enter while a control action holds `busy`
-    await delay(20);
-
+    // The submit gate runs synchronously off the input dispatch; one macrotask
+    // turn (which drains every queued microtask first) is a deterministic
+    // settle for the prompt check.
+    await delay(0);
     assert.deepEqual(driver.prompts, []);
-    assert.ok(plainTerminalOutput(terminal.screenOutput()).includes('a draft to keep'));
+    // Sentinel render: the draft growing by the typed char proves the editor
+    // kept it — a wrongful submit would have cleared it first.
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal) === 'a draft to keepz');
 
     driver.releaseSetModel();
-    await delay(20);
+    // The control action settles through its promise continuations; one
+    // macrotask turn runs strictly after them, releasing `busy` for /exit.
+    await delay(0);
     terminal.input('\x03'); // clear the preserved draft
     terminal.input('/exit');
     terminal.input('\r');
@@ -2577,9 +2680,11 @@ describe('Maka Pi TUI runner', () => {
       );
     });
 
-    // The old bounded poll gave up after ~2s of busy and silently dropped the
-    // text; a normal turn easily outlives that budget.
-    await delay(2200);
+    // The old bounded poll gave up after ~2s of busy (about 20 attempts at the
+    // 100ms retry cadence) and silently dropped the text. Waiting for the
+    // driver to observe the retries crossing that budget — instead of guessing
+    // elapsed time — proves the CLI is still retrying under any scheduler load.
+    await waitForUpTo(() => driver.steerAttempts > 22 && driver.queueAttempts > 22, 30_000);
     const screen = plainTerminalOutput(terminal.screenOutput());
     assert.equal(screen.includes('Steering: second thought'), true);
     assert.equal(screen.includes('Queued: and afterwards'), true);
@@ -2590,7 +2695,7 @@ describe('Maka Pi TUI runner', () => {
     await waitFor(() => driver.prompts.length === 2);
     assert.equal(driver.prompts[1], 'second thought\n\nand afterwards');
 
-    await waitFor(() => driver.parked);
+    await waitForUpTo(() => driver.parked, 1_000);
     driver.endTurn();
     await waitFor(() => terminal.progressStates.at(-1) === false);
     terminal.input('/exit');
@@ -2629,6 +2734,73 @@ describe('Maka Pi TUI runner', () => {
     await waitFor(() => terminal.progressStates.at(-1) === false);
     // Nothing left to flush: the text was delivered mid-turn, not re-queued.
     assert.deepEqual(driver.prompts, ['start the work']);
+    terminal.input('/exit');
+    terminal.input('\r');
+    await run;
+  });
+
+  test('a turn boundary waits for an unresolved enqueue before deciding whether to flush it', async () => {
+    const terminal = new FakeTerminal();
+    const driver = new DeferredAdmissionDriver();
+    const run = runMakaPiTui({
+      title: 'Maka',
+      driver,
+      cwd: '/repo',
+      model: 'm',
+      connectionSlug: 'c',
+      permissionMode: 'bypass',
+      terminal,
+    });
+
+    terminal.input('start');
+    terminal.input('\r');
+    await waitFor(() => terminal.progressStates.at(-1) === true);
+    await waitForUpTo(() => driver.parked, 1_000);
+    terminal.input('late admission');
+    terminal.input('\r');
+    await waitFor(() => driver.steerCalls === 1);
+
+    driver.endTurn();
+    await waitFor(() => driver.completedTurns === 1);
+    assert.deepEqual(driver.prompts, ['start']);
+    driver.releaseAdmission({ kind: 'fallback' });
+    await waitForUpTo(() => driver.prompts.length === 2, 1_000);
+    assert.equal(driver.prompts[1], 'late admission');
+
+    await waitForUpTo(() => driver.parked, 1_000);
+    driver.endTurn();
+    await waitFor(() => terminal.progressStates.at(-1) === false);
+    terminal.input('/exit');
+    terminal.input('\r');
+    await run;
+  });
+
+  test('a queued retry settling at the turn boundary is not also flushed as a new turn', async () => {
+    const terminal = new FakeTerminal();
+    const driver = new DeferredRetryDriver();
+    const run = runMakaPiTui({
+      title: 'Maka',
+      driver,
+      cwd: '/repo',
+      model: 'm',
+      connectionSlug: 'c',
+      permissionMode: 'bypass',
+      terminal,
+    });
+
+    terminal.input('start');
+    terminal.input('\r');
+    await waitFor(() => terminal.progressStates.at(-1) === true);
+    terminal.input('lands on retry');
+    terminal.input('\r');
+    await waitForUpTo(() => driver.steerCalls === 2, 1_000);
+
+    driver.endTurn();
+    driver.releaseRetry();
+    await waitFor(() => terminal.progressStates.at(-1) === false);
+    assert.deepEqual(driver.prompts, ['start']);
+    assert.deepEqual(driver.delivered, ['lands on retry']);
+
     terminal.input('/exit');
     terminal.input('\r');
     await run;
@@ -2697,19 +2869,25 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('after stop');
     terminal.input('\r'); // Enter: submits are disabled during convergence
     terminal.input('\x1b\r'); // Alt+Enter: gated before touching the editor
-    await delay(20);
+    // The convergence gates run synchronously off the input dispatch; one
+    // macrotask turn (which drains every queued microtask first) settles them.
+    await delay(0);
 
     driver.endTurn(); // the aborted turn finally terminates
     await waitFor(() => terminal.progressStates.at(-1) === false);
-    await delay(30);
-    // No second turn is prepared; the typed text is still in the editor as a draft.
-    assert.deepEqual(driver.prompts, ['start the work']);
-    assert.equal(plainTerminalOutput(terminal.screenOutput()).includes('after stop'), true);
+    // The typed text is still in the editor as a draft, never a queued line.
+    await waitFor(() => {
+      const screen = plainTerminalOutput(terminal.screenOutput());
+      return screen.includes('after stop') && !screen.includes('Queued: after stop');
+    });
 
     terminal.input('\x03'); // clear the preserved draft
     terminal.input('/exit');
     terminal.input('\r');
     await run;
+    // Anchored after close: a wrongly-opened second turn would have landed in
+    // prompts by the time the TUI has fully shut down.
+    assert.deepEqual(driver.prompts, ['start the work']);
   });
 
   test('an aborted turn never auto-opens the flush turn; undelivered text becomes a draft', async () => {
@@ -2740,8 +2918,6 @@ describe('Maka Pi TUI runner', () => {
     driver.abortNextTurn = true;
     driver.endTurn();
     await waitFor(() => terminal.progressStates.at(-1) === false);
-    await delay(30);
-    assert.deepEqual(driver.prompts, ['start the work']);
     // The undelivered text is an editable draft, not a queued line.
     await waitFor(() => {
       const screen = plainTerminalOutput(terminal.screenOutput());
@@ -2752,6 +2928,9 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('/exit');
     terminal.input('\r');
     await run;
+    // Anchored after close: a wrongly-opened flush turn would have landed in
+    // prompts by the time the TUI has fully shut down.
+    assert.deepEqual(driver.prompts, ['start the work']);
   });
 
   test('closes the main TUI on Ctrl-D', async () => {
@@ -2771,7 +2950,7 @@ describe('Maka Pi TUI runner', () => {
 
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close after Ctrl-D');
       }),
     ]);
@@ -2825,7 +3004,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -2851,14 +3030,18 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('\r');
     await waitFor(() => driver.models.length === 1);
     terminal.input('\x03');
-    await delay(20);
+    // The rendered hint is the observable effect of the first Ctrl-C arming
+    // the exit gesture without closing anything.
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('Press Ctrl+C again to exit.'),
+    );
 
     try {
       assert.equal(terminal.stopCalls, 0);
       terminal.input('\x03');
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close after the second Ctrl-C');
         }),
       ]);
@@ -2900,7 +3083,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -2954,7 +3137,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -2979,11 +3162,12 @@ describe('Maka Pi TUI runner', () => {
     assert.deepEqual(driver.permissionModes, []);
 
     terminal.input('\r');
-    await delay(20);
-    assert.deepEqual(driver.permissionModes, []);
 
     exitMaka(terminal);
     await run;
+    // Anchored after close: every queued input has been drained, so a bare
+    // Enter that wrongly confirmed the switch would show in permissionModes.
+    assert.deepEqual(driver.permissionModes, []);
   });
 
   test('returns from Bypass to Auto without a confirmation', async () => {
@@ -3211,7 +3395,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3245,7 +3429,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3295,7 +3479,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3352,7 +3536,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3388,7 +3572,7 @@ describe('Maka Pi TUI runner', () => {
       terminal,
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/model');
     terminal.input('\r');
     await waitFor(() => terminal.output().includes('Select Model'));
@@ -3412,7 +3596,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3448,12 +3632,13 @@ describe('Maka Pi TUI runner', () => {
       terminal,
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/model');
     terminal.input('\r');
     await waitFor(() => terminal.output().includes('Select Model'));
     terminal.input('\x1b');
-    await delay(30);
+    // The picker leaving the screen is the observable effect of the cancel.
+    await waitFor(() => !plainTerminalOutput(terminal.screenOutput()).includes('Select Model'));
 
     // Esc closed the picker without rebinding: no setModel call, and the status
     // line still shows the original model + connection.
@@ -3466,7 +3651,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3502,7 +3687,7 @@ describe('Maka Pi TUI runner', () => {
       terminal,
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/model glm-5.2');
     terminal.input('\r');
     await waitFor(() => driver.models.length === 1);
@@ -3516,7 +3701,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3561,7 +3746,7 @@ describe('Maka Pi TUI runner', () => {
       terminal,
     });
 
-    await delay(20);
+    await waitForTuiPaint(terminal);
     terminal.input('/model');
     terminal.input('\r');
     await waitFor(() => terminal.output().includes('Select Model'));
@@ -3602,7 +3787,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(500).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3663,7 +3848,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3692,7 +3877,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3722,7 +3907,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3837,7 +4022,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3959,7 +4144,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -3998,7 +4183,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4064,7 +4249,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4118,7 +4303,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4159,9 +4344,12 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('go');
     terminal.input('\r');
     await waitFor(() => driver.prompts.length === 1);
-    // The driver's promptEvents completes near-instantly (no manual gating),
-    // so give the token_usage + complete events time to drain and render.
-    await delay(20);
+    // The turn ending is the observable drain point for the token_usage +
+    // complete events; the sentinel char then forces one more full frame, so a
+    // wrongly-rendered ctx segment would be in the cumulative output by now.
+    await waitFor(() => terminal.progressStates.at(-1) === false);
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal) === 'z');
 
     // Bug under test: the pre-switch session's 1_000 window must not survive
     // to render a (wrong) ctx total against the curated-out model's usage.
@@ -4170,7 +4358,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4379,7 +4567,10 @@ describe('Maka Pi TUI runner', () => {
     await waitFor(() =>
       plainTerminalOutput(terminal.output()).includes('Background task completed: build'),
     );
-    await delay(50);
+    // Sentinel render: a duplicate announcement from the same update would be
+    // in the cumulative output by the time the typed char paints.
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal) === 'z');
     const announcements =
       plainTerminalOutput(terminal.output()).split('Background task completed').length - 1;
     assert.equal(announcements, 1);
@@ -4420,7 +4611,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4527,9 +4718,10 @@ describe('Maka Pi TUI runner', () => {
     );
     terminal.input('\x1b[B');
     terminal.input('\r');
-    await delay(10);
+    // Selection handling runs synchronously off the input dispatch; one
+    // macrotask turn (which drains every queued microtask first) settles it.
+    await delay(0);
 
-    assert.deepEqual(driver.sessionIds, []);
     assert.match(
       plainTerminalOutput(terminal.screenOutput()),
       /Legacy chat.*Missing working directory/,
@@ -4538,6 +4730,8 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('\x1b');
     exitMaka(terminal);
     await run;
+    // Anchored after close: a wrongly-honored resume would show in sessionIds.
+    assert.deepEqual(driver.sessionIds, []);
   });
 
   test('/context renders persisted request diagnostics without preparing a model turn', async () => {
@@ -4603,7 +4797,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4647,7 +4841,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -4697,7 +4891,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4733,6 +4927,9 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('\r');
     await waitFor(() => driver.startNewSessionCalls === 1);
     const attemptsAfterReset = hydrationAttempts;
+    // Real-timer negative window, derived from the hydration retry schedule
+    // (first retry arms at 250ms): outliving that slot with no new attempt
+    // proves /new's reset cleared the timer rather than letting it fire.
     await delay(300);
     assert.equal(hydrationAttempts, attemptsAfterReset);
 
@@ -4774,10 +4971,12 @@ describe('Maka Pi TUI runner', () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(automationAcquired, false);
 
-    // While the model switch is in flight, typing + Enter must not send a prompt.
+    // While the model switch is in flight, typing + Enter must not send a
+    // prompt. The submit gate runs synchronously off the input dispatch; one
+    // macrotask turn (which drains every queued microtask first) settles it.
     terminal.input('blocked');
     terminal.input('\r');
-    await delay(20);
+    await delay(0);
     assert.deepEqual(driver.prompts, []);
 
     // After the switch completes, the previously typed prompt goes through.
@@ -4785,7 +4984,9 @@ describe('Maka Pi TUI runner', () => {
     await admission.whenIdle;
     const automationLease = await automationActivity;
     automationLease.release();
-    await delay(20);
+    // The control action's busy release settles through its promise
+    // continuations; one macrotask turn runs strictly after them.
+    await delay(0);
     terminal.input('\r');
     await waitFor(() => driver.prompts.length === 1);
     assert.deepEqual(driver.prompts, ['blocked']);
@@ -4793,7 +4994,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4818,20 +5019,17 @@ describe('Maka Pi TUI runner', () => {
 
     terminal.input('y');
     await waitFor(() => driver.responses.length === 1);
-    await delay(20);
 
-    // Response rejected: error shows, but the boundary prompt stays and can be retried.
-    assert.ok(
-      plainTerminalOutput(terminal.output()).includes('Allow access outside the workspace?'),
-    );
-
+    // Response rejected: the boundary prompt stays armed and can be retried.
+    // The second response landing is the observable proof — an unarmed prompt
+    // would swallow the 'n' instead of responding.
     terminal.input('n');
     await waitFor(() => driver.responses.length === 2);
 
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4855,19 +5053,22 @@ describe('Maka Pi TUI runner', () => {
     await waitFor(() => driver.listCalls === 1);
 
     // While the list is still loading, a submitted prompt must not go through.
+    // The submit gate runs synchronously off the input dispatch; one macrotask
+    // turn (which drains every queued microtask first) settles it.
     terminal.input('hello');
     terminal.input('\r');
-    await delay(20);
+    await delay(0);
     assert.deepEqual(driver.prompts, []);
 
     driver.releaseList();
-    await delay(30);
+    // The rendered picker is the observable arming signal for the Escape.
+    await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('Existing chat'));
 
     terminal.input('\x1b');
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4890,8 +5091,11 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('\r');
     await waitFor(() => terminal.progressStates.at(-1) === true);
 
+    // Escape handling runs synchronously off the input dispatch; one macrotask
+    // turn (which drains every queued microtask first) is a deterministic
+    // settle for the single-Escape-does-not-stop check.
     terminal.input('\x1b');
-    await delay(20);
+    await delay(0);
     assert.equal(driver.stopCalls, 0);
 
     terminal.input('\x1b');
@@ -4904,13 +5108,13 @@ describe('Maka Pi TUI runner', () => {
     // notice, but the contract under test is that stopSession is not fired again.
     terminal.input('\x1b');
     terminal.input('\x1b');
-    await delay(20);
+    await delay(0);
     assert.equal(driver.stopCalls, 1);
 
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -4957,7 +5161,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -5330,7 +5534,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -5355,12 +5559,19 @@ describe('Maka Pi TUI runner', () => {
       ),
     );
 
-    // A single Escape falls through to the editor: no picker yet.
+    // A single Escape falls through to the editor: no picker yet. Sentinel
+    // render: a wrongly-opened picker would be in the cumulative output by the
+    // time the typed char paints. The char resets the gesture either way, so
+    // it is removed before the real double Escape below.
     terminal.input('\x1b');
-    await delay(40);
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal) === 'z');
     assert.equal(plainTerminalOutput(terminal.output()).includes('回到选定轮次'), false);
+    terminal.input('\x7f');
+    await waitFor(() => editorInputText(terminal) === '');
 
-    // A second Escape within the window completes the gesture and opens the picker.
+    // A consecutive Escape pair completes the gesture and opens the picker.
+    terminal.input('\x1b');
     terminal.input('\x1b');
     await waitFor(() => plainTerminalOutput(terminal.output()).includes('回到选定轮次'));
 
@@ -5371,7 +5582,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -5396,24 +5607,28 @@ describe('Maka Pi TUI runner', () => {
       ),
     );
 
-    // While a draft is present, Escape belongs to the editor (clear input), not
-    // the rewind gesture. Two Escapes must not open the picker.
+    // While a draft is present, Escape belongs to the editor, not the rewind
+    // gesture. Two Escapes must not open the picker. Input dispatch is
+    // synchronous, so no settling is needed between keys.
     terminal.input('draft in progress');
-    await delay(20);
+    await waitFor(() => editorInputText(terminal) === 'draft in progress');
     terminal.input('\x1b');
-    await delay(20);
     terminal.input('\x1b');
-    await delay(40);
+    // Sentinel render: a wrongly-opened picker would be on screen by the time
+    // the typed char paints.
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal).endsWith('z'));
     assert.equal(plainTerminalOutput(terminal.screenOutput()).includes('回到选定轮次'), false);
-    assert.deepEqual(driver.rewound, []);
 
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
+    // Anchored after close: a wrongly-opened picker selection would show here.
+    assert.deepEqual(driver.rewound, []);
   });
 
   test('a non-Escape key between two Escapes does not open the rewind picker', async () => {
@@ -5437,18 +5652,20 @@ describe('Maka Pi TUI runner', () => {
 
     // The editor stays neutral (empty) throughout, but a left-arrow between the
     // two Escapes breaks the gesture: the two Escapes must be consecutive.
+    // Input dispatch is synchronous, so no settling is needed between keys.
     terminal.input('\x1b');
-    await delay(20);
     terminal.input('\x1b[D');
-    await delay(20);
     terminal.input('\x1b');
-    await delay(40);
+    // Sentinel render: a wrongly-opened picker would be on screen by the time
+    // the typed char paints.
+    terminal.input('z');
+    await waitFor(() => editorInputText(terminal) === 'z');
     assert.equal(plainTerminalOutput(terminal.screenOutput()).includes('回到选定轮次'), false);
 
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -5477,10 +5694,12 @@ describe('Maka Pi TUI runner', () => {
 
     // The turn has not ended yet (runtime stop is still settling). Further
     // double-Escapes must be swallowed, not fire a second stopSession that
-    // would append a duplicate abort note to the session log.
+    // would append a duplicate abort note to the session log. Escape handling
+    // runs synchronously off the input dispatch; one macrotask turn (which
+    // drains every queued microtask first) is a deterministic settle.
     terminal.input('\x1b');
     terminal.input('\x1b');
-    await delay(30);
+    await delay(0);
     assert.equal(driver.stopCalls, 1);
 
     driver.endTurn();
@@ -5489,7 +5708,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -5547,7 +5766,7 @@ describe('Maka Pi TUI runner', () => {
     try {
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close after a second Ctrl-C');
         }),
       ]);
@@ -5576,7 +5795,11 @@ describe('Maka Pi TUI runner', () => {
     terminal.input('run');
     terminal.input('\r');
     await waitFor(() => driver.boundaryRequests === 1);
-    await delay(20);
+    // The rendered prompt is the observable arming signal: only once it owns
+    // input do the Escapes mean deny instead of an interrupt gesture.
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('Allow access outside the workspace?'),
+    );
 
     terminal.input('\x1b');
     terminal.input('\x1b');
@@ -5589,7 +5812,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -5622,16 +5845,17 @@ describe('Maka Pi TUI runner', () => {
 
     // y must not trigger a response for the now-dead request.
     terminal.input('y');
-    await delay(20);
-    assert.equal(driver.respondCalls, 0);
 
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
+    // Anchored after close: every queued input has been drained, so a response
+    // for the dead request would show in respondCalls by now.
+    assert.equal(driver.respondCalls, 0);
   });
 
   test('enables focus reporting only after raw mode, so no stray ^[[I leaks on launch', async () => {
@@ -5663,7 +5887,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -5697,7 +5921,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -5743,11 +5967,36 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
     });
+  });
+
+  test('uses a Host Skill catalog for presentation while leaving invocation preparation to Host', async () => {
+    const terminal = new FakeTerminal();
+    const driver = new SlashCommandDriver();
+    const run = runMakaPiTui({
+      title: 'Maka',
+      driver,
+      cwd: '/repo',
+      model: 'claude-sonnet-4-5',
+      connectionSlug: 'claude-subscription',
+      permissionMode: 'ask',
+      terminal,
+      listSkills: async () => [
+        { ref: 'project:alpha', id: 'alpha', name: 'Alpha', description: 'Alpha skill' },
+      ],
+    });
+
+    terminal.input('/skill:alpha help');
+    terminal.input('\r');
+    await waitFor(() => driver.prompts.length === 1);
+
+    assert.equal(driver.prompts[0], '/skill:alpha help');
+    exitMaka(terminal);
+    await run;
   });
 
   // Governance closeout: an all-failed explicit invocation yields a bounded
@@ -5779,7 +6028,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -5818,7 +6067,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -5826,41 +6075,6 @@ describe('Maka Pi TUI runner', () => {
   });
 
   describe('/recap command', () => {
-    test('shows the cleaned recap text on success', async () => {
-      const terminal = new FakeTerminal();
-      const driver = new RewindDriver([{ turnId: 'turn-1', label: 'first prompt' }]);
-      const run = runMakaPiTui({
-        title: 'Maka',
-        driver,
-        cwd: '/repo',
-        model: 'claude-sonnet-4-5',
-        connectionSlug: 'claude-subscription',
-        permissionMode: 'ask',
-        terminal,
-        recap: {
-          generate: async () => ({
-            ok: true,
-            text: 'We fixed the recap bug.',
-            raw: 'We fixed the recap bug.',
-          }),
-        },
-      });
-
-      terminal.input('/recap');
-      terminal.input('\r');
-      await waitFor(() =>
-        plainTerminalOutput(terminal.output()).includes('Recap: We fixed the recap bug.'),
-      );
-
-      exitMaka(terminal);
-      await Promise.race([
-        run,
-        delay(50).then(() => {
-          throw new Error('TUI did not close during test cleanup');
-        }),
-      ]);
-    });
-
     test('a second /recap while one is in flight reports it is already running, without a second generate() call', async () => {
       const terminal = new FakeTerminal();
       const driver = new RewindDriver([{ turnId: 'turn-1', label: 'first prompt' }]);
@@ -5902,7 +6116,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -5969,7 +6183,11 @@ describe('Maka Pi TUI runner', () => {
       await submit('a later prompt', 2);
 
       gate.resolve();
-      await delay(50);
+      // Sentinel render: a wrongly-rendered recap would be in the cumulative
+      // output by the time the typed char paints (the recap continuation
+      // settles on microtasks before that render lands).
+      terminal.input('z');
+      await waitFor(() => editorInputText(terminal) === 'z');
       assert.equal(
         plainTerminalOutput(terminal.output()).includes('Recap: stale recap result'),
         false,
@@ -5979,7 +6197,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -6034,7 +6252,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -6076,7 +6294,11 @@ describe('Maka Pi TUI runner', () => {
       await driver.switchSession('session-2');
 
       gate.resolve();
-      await delay(50);
+      // Sentinel render: a wrongly-rendered recap would be in the cumulative
+      // output by the time the typed char paints (the recap continuation
+      // settles on microtasks before that render lands).
+      terminal.input('z');
+      await waitFor(() => editorInputText(terminal) === 'z');
       assert.equal(
         plainTerminalOutput(terminal.output()).includes('Recap:'),
         false,
@@ -6086,7 +6308,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -6147,7 +6369,7 @@ describe('Maka Pi TUI runner', () => {
       exitMaka(terminal);
       await Promise.race([
         run,
-        delay(50).then(() => {
+        delay(CLOSE_BUDGET_MS).then(() => {
           throw new Error('TUI did not close during test cleanup');
         }),
       ]);
@@ -6172,7 +6394,7 @@ describe('Maka Pi TUI runner', () => {
 
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close on a bare "quit" line');
       }),
     ]);
@@ -6207,7 +6429,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -6243,10 +6465,68 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
+  });
+
+  test('resumes an active Host turn from its atomic transcript and continues live output', async () => {
+    const terminal = new FakeTerminal();
+    const driver = new ActiveResumeDriver();
+    const run = runMakaPiTui({
+      title: 'Maka',
+      driver,
+      cwd: '/repo',
+      model: 'claude-sonnet-4-5',
+      connectionSlug: 'claude-subscription',
+      permissionMode: 'ask',
+      terminal,
+      resumeSessionId: 'session-2',
+    });
+
+    await waitFor(() => plainTerminalOutput(terminal.output()).includes('Hello world'));
+    await waitFor(() => terminal.progressStates.at(-1) === false);
+    assert.deepEqual(driver.prompts, []);
+
+    terminal.input('/exit');
+    terminal.input('\r');
+    await run;
+  });
+
+  test('adopts a Host-started successor after the visible turn reaches its boundary', async () => {
+    const terminal = new FakeTerminal();
+    const driver = new HostSuccessorDriver();
+    const run = runMakaPiTui({
+      title: 'Maka',
+      driver,
+      cwd: '/repo',
+      model: 'claude-sonnet-4-5',
+      connectionSlug: 'claude-subscription',
+      permissionMode: 'ask',
+      terminal,
+      listShellRunUpdates: (sessionId) => driver.listShellRunUpdates(sessionId),
+    });
+
+    terminal.input('first');
+    terminal.input('\r');
+    await waitFor(() => terminal.progressStates.at(-1) === true);
+    driver.publishSuccessor();
+    driver.probeFirstTurn();
+    await waitFor(() => plainTerminalOutput(terminal.output()).includes('First still active'));
+    assert.equal(driver.successorPulls, 0);
+    assert.equal(plainTerminalOutput(terminal.output()).includes('Second answer'), false);
+
+    driver.finishFirstTurn();
+    await waitFor(() => plainTerminalOutput(terminal.output()).includes('Second answer'));
+    await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('(4s · 2 lines)'));
+    await waitFor(() => terminal.progressStates.at(-1) === false);
+    assert.deepEqual(driver.prompts, ['first']);
+    assert.deepEqual(driver.shellRunReads, ['session-1']);
+
+    terminal.input('/exit');
+    terminal.input('\r');
+    await run;
   });
 
   test('reports a resume failure and continues with the fresh session', async () => {
@@ -6277,7 +6557,7 @@ describe('Maka Pi TUI runner', () => {
     exitMaka(terminal);
     await Promise.race([
       run,
-      delay(50).then(() => {
+      delay(CLOSE_BUDGET_MS).then(() => {
         throw new Error('TUI did not close during test cleanup');
       }),
     ]);
@@ -6643,28 +6923,28 @@ class SteeringTurnDriver implements MakaSessionDriver {
     yield { type: 'complete', id: 'event-complete', turnId, ts: 2, stopReason: 'user_stop' };
   }
 
-  steer(text: string): QueueEnqueueOutcome {
+  async steer(text: string): Promise<QueueEnqueueOutcome> {
     this.steered.push(text);
     this.steering.push(text);
     this.emitQueueUpdate();
     return { kind: 'queued' };
   }
 
-  queueMessage(text: string): QueueEnqueueOutcome {
+  async queueMessage(text: string): Promise<QueueEnqueueOutcome> {
     this.queuedMessages.push(text);
     this.followup.push(text);
     this.emitQueueUpdate();
     return { kind: 'queued' };
   }
 
-  takePendingFollowup(): string | null {
+  async takePendingFollowup(): Promise<string | null> {
     if (this.followup.length === 0) return null;
     const joined = this.followup.join('\n\n');
     this.followup = [];
     return joined;
   }
 
-  retractQueued(): string {
+  async retractQueued(): Promise<string> {
     this.retractCalls += 1;
     const joined = [...this.steering, ...this.followup].join('\n\n');
     this.steering = [];
@@ -6719,9 +6999,13 @@ class FallbackSteeringDriver implements MakaSessionDriver {
   readonly steered: string[] = [];
   readonly queuedMessages: string[] = [];
   stopCalls = 0;
+  completedTurns = 0;
   /** Enqueue calls that report `fallback` before the owner "appears". */
   steerFallbacks = Number.POSITIVE_INFINITY;
   queueFallbacks = Number.POSITIVE_INFINITY;
+  /** Total enqueue attempts, including rejected ones — the observable retry count. */
+  steerAttempts = 0;
+  queueAttempts = 0;
   private steering: string[] = [];
   private followup: string[] = [];
   private pendingEvents: SessionEvent[] = [];
@@ -6796,6 +7080,7 @@ class FallbackSteeringDriver implements MakaSessionDriver {
         ts: 2,
         stopReason: 'user_stop',
       };
+      this.completedTurns += 1;
       return;
     }
     yield {
@@ -6805,12 +7090,14 @@ class FallbackSteeringDriver implements MakaSessionDriver {
       ts: 1,
       stopReason: 'end_turn',
     };
+    this.completedTurns += 1;
   }
 
   /** Next endTurn() finishes the turn as aborted instead of end_turn. */
   abortNextTurn = false;
 
-  steer(text: string): QueueEnqueueOutcome {
+  async steer(text: string): Promise<QueueEnqueueOutcome> {
+    this.steerAttempts += 1;
     if (this.steerFallbacks > 0) {
       this.steerFallbacks -= 1;
       return { kind: 'fallback' };
@@ -6821,7 +7108,8 @@ class FallbackSteeringDriver implements MakaSessionDriver {
     return { kind: 'queued' };
   }
 
-  queueMessage(text: string): QueueEnqueueOutcome {
+  async queueMessage(text: string): Promise<QueueEnqueueOutcome> {
+    this.queueAttempts += 1;
     if (this.queueFallbacks > 0) {
       this.queueFallbacks -= 1;
       return { kind: 'fallback' };
@@ -6832,14 +7120,14 @@ class FallbackSteeringDriver implements MakaSessionDriver {
     return { kind: 'queued' };
   }
 
-  takePendingFollowup(): string | null {
+  async takePendingFollowup(): Promise<string | null> {
     if (this.followup.length === 0) return null;
     const joined = this.followup.join('\n\n');
     this.followup = [];
     return joined;
   }
 
-  retractQueued(): string {
+  async retractQueued(): Promise<string> {
     const joined = [...this.steering, ...this.followup].join('\n\n');
     this.steering = [];
     this.followup = [];
@@ -6877,6 +7165,38 @@ class FallbackSteeringDriver implements MakaSessionDriver {
   startNewSession(): void {}
   getSessionId(): string {
     return 'session-1';
+  }
+}
+
+class DeferredAdmissionDriver extends FallbackSteeringDriver {
+  steerCalls = 0;
+  readonly #admission = deferred<QueueEnqueueOutcome>();
+
+  override async steer(_text: string): Promise<QueueEnqueueOutcome> {
+    this.steerCalls += 1;
+    return this.#admission.promise;
+  }
+
+  releaseAdmission(outcome: QueueEnqueueOutcome): void {
+    this.#admission.resolve(outcome);
+  }
+}
+
+class DeferredRetryDriver extends FallbackSteeringDriver {
+  steerCalls = 0;
+  readonly delivered: string[] = [];
+  readonly #retry = deferred<void>();
+
+  override async steer(text: string): Promise<QueueEnqueueOutcome> {
+    this.steerCalls += 1;
+    if (this.steerCalls === 1) return { kind: 'fallback' };
+    await this.#retry.promise;
+    this.delivered.push(text);
+    return { kind: 'queued' };
+  }
+
+  releaseRetry(): void {
+    this.#retry.resolve();
   }
 }
 
@@ -7627,6 +7947,183 @@ class FailingSwitchSessionDriver extends SlashCommandDriver {
   }
 }
 
+class ActiveResumeDriver extends SlashCommandDriver {
+  override async switchSession(sessionId: string): Promise<MakaSessionSwitchResult> {
+    const switched = await super.switchSession(sessionId);
+    const turnId = 'turn-active';
+    return {
+      ...switched,
+      messages: [
+        storedUserMessage('user-active', turnId, 'Question'),
+        storedAssistantMessage('assistant-active', turnId, 'Hello'),
+      ],
+      activeTurn: {
+        sessionId,
+        turnId,
+        events: (async function* () {
+          yield {
+            type: 'text_delta',
+            id: 'delta-active',
+            turnId,
+            messageId: 'assistant-active',
+            ts: 2,
+            text: ' world',
+          } satisfies SessionEvent;
+          yield {
+            type: 'text_complete',
+            id: 'text-active',
+            turnId,
+            messageId: 'assistant-active',
+            ts: 3,
+            text: 'Hello world',
+          } satisfies SessionEvent;
+          yield {
+            type: 'complete',
+            id: 'complete-active',
+            turnId,
+            ts: 4,
+            stopReason: 'end_turn',
+          } satisfies SessionEvent;
+        })(),
+      },
+    };
+  }
+}
+
+class HostSuccessorDriver extends SlashCommandDriver {
+  #startedTurnListener: ((turn: MakaAttachedSessionTurn) => void) | undefined;
+  readonly #probeFirst = deferred<void>();
+  #finishFirst: (() => void) | undefined;
+  successorPulls = 0;
+  readonly shellRunReads: string[] = [];
+
+  override async *promptEvents(_prompt: string, turnId = 'turn-1'): AsyncIterable<SessionEvent> {
+    await this.#probeFirst.promise;
+    yield {
+      type: 'text_delta',
+      id: 'text-delta-first',
+      turnId,
+      messageId: 'assistant-first',
+      ts: 1,
+      text: 'First still active',
+    };
+    yield {
+      type: 'text_complete',
+      id: 'text-complete-first',
+      turnId,
+      messageId: 'assistant-first',
+      ts: 2,
+      text: 'First still active',
+    };
+    await new Promise<void>((resolve) => {
+      this.#finishFirst = resolve;
+    });
+    yield { type: 'complete', id: 'complete-first', turnId, ts: 3, stopReason: 'end_turn' };
+  }
+
+  subscribeStartedTurns(listener: (turn: MakaAttachedSessionTurn) => void): () => void {
+    this.#startedTurnListener = listener;
+    return () => {
+      if (this.#startedTurnListener === listener) this.#startedTurnListener = undefined;
+    };
+  }
+
+  publishSuccessor(): void {
+    const turnId = 'turn-second';
+    const driver = this;
+    this.#startedTurnListener?.({
+      sessionId: this.getSessionId()!,
+      turnId,
+      messages: [
+        storedUserMessage('user-second', turnId, 'Second question'),
+        {
+          type: 'tool_call',
+          id: 'tool-bg',
+          turnId,
+          ts: 1,
+          toolName: 'Bash',
+          args: { command: 'build' },
+        },
+        {
+          type: 'tool_result',
+          id: 'result-bg',
+          turnId,
+          ts: 2,
+          toolUseId: 'tool-bg',
+          isError: false,
+          content: {
+            kind: 'shell_run',
+            ref: 'maka://runtime/background-tasks/bg-successor',
+            mode: 'pipes',
+            status: 'running',
+            cwd: '/repo',
+            cmd: 'build',
+            startedAt: 1_000,
+            updatedAt: 2_000,
+            revision: 2_000,
+            output: pipeOutput('starting\n'),
+          },
+        },
+        storedAssistantMessage('assistant-second', turnId, 'Second'),
+      ],
+      summary: fakeSessionSummary(this.getSessionId()!),
+      events: (async function* () {
+        driver.successorPulls += 1;
+        yield {
+          type: 'text_delta',
+          id: 'delta-second',
+          turnId,
+          messageId: 'assistant-second',
+          ts: 2,
+          text: ' answer',
+        } satisfies SessionEvent;
+        yield {
+          type: 'complete',
+          id: 'complete-second',
+          turnId,
+          ts: 3,
+          stopReason: 'end_turn',
+        } satisfies SessionEvent;
+      })(),
+    });
+  }
+
+  probeFirstTurn(): void {
+    this.#probeFirst.resolve();
+  }
+
+  listShellRunUpdates(sessionId: string): Promise<ShellRunUpdate[]> {
+    this.shellRunReads.push(sessionId);
+    return Promise.resolve([
+      {
+        sessionId,
+        ownership: { kind: 'local' },
+        sourceTurnId: 'turn-second',
+        sourceToolCallId: 'tool-bg',
+        result: {
+          kind: 'shell_run',
+          ref: 'maka://runtime/background-tasks/bg-successor',
+          mode: 'pipes',
+          status: 'completed',
+          cwd: '/repo',
+          cmd: 'build',
+          startedAt: 1_000,
+          updatedAt: 5_000,
+          completedAt: 5_000,
+          exitCode: 0,
+          revision: 5_000,
+          output: pipeOutput('starting\ndone\n'),
+        },
+      },
+    ]);
+  }
+
+  finishFirstTurn(): void {
+    this.#finishFirst?.();
+    this.#finishFirst = undefined;
+  }
+}
+
 // Switches onto a session on a different connection/model, then emits a
 // token_usage event on the next turn so the ctx statusline segment can be
 // checked against the *new* session's context window.
@@ -8286,7 +8783,12 @@ async function runSignalExitProbe(
   });
   let stdout = '';
   let signalSent = false;
-  let killTimer = setTimeout(() => child.kill('SIGKILL'), 5_000);
+  // Cold-start guard: spawning Node and synchronously importing the TUI stack
+  // (runner, driver, shell-run manager) can take well over 5 s on a loaded CI
+  // runner before READY is ever flushed, so the pre-READY budget must be a
+  // generous backstop against a child that never becomes ready, not a tight
+  // deadline. The precise budget starts once READY arrives, below.
+  let killTimer = setTimeout(() => child.kill('SIGKILL'), 30_000);
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk: string) => {
     stdout += chunk;
@@ -8294,10 +8796,11 @@ async function runSignalExitProbe(
       signalSent = true;
       child.kill(signalToSend);
       // Time the kill against the signal handling window, not the child's
-      // startup: on a slow CI runner importing the TUI and reaching READY can
-      // itself take seconds, which would otherwise leave the 3s exit grace
-      // (beginMakaCliExit) past the 5s kill timer and the probe would be
-      // SIGKILLed before the graceful exit it is asserting.
+      // startup: the post-signal path is synchronous (terminal restore, TUI
+      // stop, resolve, exit), so a few seconds is ample once READY is in; the
+      // 3s exit grace (beginMakaCliExit) plus the pre-READY startup must not
+      // share a single 5s budget or a slow CI runner gets SIGKILLed before the
+      // graceful exit it is asserting.
       clearTimeout(killTimer);
       killTimer = setTimeout(() => child.kill('SIGKILL'), 5_000);
     }
@@ -8393,7 +8896,11 @@ async function runFatalExitProbe(
   let stdout = '';
   let stderr = '';
   let childReady = false;
-  let killTimer = setTimeout(() => child.kill('SIGKILL'), 5_000);
+  // Same two-budget scheme as runSignalExitProbe: a generous 30 s pre-READY
+  // backstop for cold starts on loaded CI runners, then a tight 5 s budget
+  // for the post-READY fatal path (which is synchronous and needs at most the
+  // 3 s exit grace from beginMakaCliExit).
+  let killTimer = setTimeout(() => child.kill('SIGKILL'), 30_000);
   child.stdout.setEncoding('utf8');
   child.stderr.setEncoding('utf8');
   child.stdout.on('data', (chunk: string) => {

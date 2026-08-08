@@ -33,12 +33,28 @@ import {
 } from './skill-invocation-feedback.js';
 
 export type PendingAttachment = {
+  /** Unique per staged item; keys the preview cache and its cleanup, so a
+   *  preview resolving after its item left the list can never strand an
+   *  orphan entry. */
+  stagingKey: string;
   displayName: string;
   mimeType?: string;
   kind: import('@maka/core').AttachmentRef['kind'];
   size: number;
+  /** Composer drawer thumbnail source for image attachments. Merged in from
+   *  the preview cache only after the URL has actually decoded as an image,
+   *  so a set previewUrl always means "renderable" — anything else keeps the
+   *  named file card. */
+  previewUrl?: string;
   source: { type: 'approval'; approvalId: string; name: string } | { type: 'file'; file: File };
 };
+
+/** Stable identity for a staged attachment across preview-URL merges. The
+ *  drawer list is re-derived when a preview lands, so submitted items must
+ *  be matched by their source — never by object reference. */
+export function pendingAttachmentSourceKey(attachment: PendingAttachment): unknown {
+  return attachment.source.type === 'approval' ? `approval:${attachment.source.approvalId}` : attachment.source.file;
+}
 
 export interface WorkspaceFileReferencePosition {
   value: string;
@@ -91,7 +107,6 @@ export interface AppShellChatActions {
       quotes?: readonly QuoteRef[];
       workspaceFileReferences?: readonly WorkspaceFileReferencePosition[];
       displayText?: string;
-      voiceOperationId?: string;
       onSessionResolved?: (sessionId: string) => void;
     },
   ): Promise<boolean>;
@@ -101,7 +116,9 @@ export interface AppShellChatActions {
   retryMessages(sessionId: string): Promise<void>;
 }
 
-function toIngestItems(pending: readonly PendingAttachment[]): RendererIngestInput[] {
+export function toRendererIngestItems(
+  pending: readonly PendingAttachment[],
+): RendererIngestInput[] {
   return pending.map((p) =>
     p.source.type === 'approval'
       ? {
@@ -281,7 +298,6 @@ export function createAppShellChatActions(deps: {
       quotes?: readonly QuoteRef[];
       workspaceFileReferences?: readonly WorkspaceFileReferencePosition[];
       displayText?: string;
-      voiceOperationId?: string;
       onSessionResolved?: (sessionId: string) => void;
     } = {},
   ): Promise<boolean> {
@@ -335,13 +351,15 @@ export function createAppShellChatActions(deps: {
         optimisticSessionId = session.id;
         optimisticTurnId = turnId;
         armTurnActive(session.id, turnId);
-        const attachmentItems = pending && pending.length > 0 ? toIngestItems(pending) : undefined;
+        const attachmentItems =
+          pending && pending.length > 0
+            ? toRendererIngestItems(pending)
+            : undefined;
         const sendResult = await window.maka.sessions.send(session.id, {
           type: 'send',
           turnId,
           text,
           ...(options.displayText ? { displayText: options.displayText } : {}),
-          ...(options.voiceOperationId ? { voiceOperationId: options.voiceOperationId } : {}),
           ...(options.turnOrchestration ? { turnOrchestration: options.turnOrchestration } : {}),
           ...(attachmentItems ? { attachmentItems } : {}),
           ...(quotes && quotes.length > 0 ? { quotes: [...quotes] } : {}),
@@ -388,13 +406,15 @@ export function createAppShellChatActions(deps: {
       optimisticSessionId = sessionId;
       optimisticTurnId = turnId;
       armTurnActive(sessionId, turnId);
-      const attachmentItems = pending && pending.length > 0 ? toIngestItems(pending) : undefined;
+      const attachmentItems =
+        pending && pending.length > 0
+          ? toRendererIngestItems(pending)
+          : undefined;
       const sendResult = await window.maka.sessions.send(sessionId, {
         type: 'send',
         turnId,
         text,
         ...(options.displayText ? { displayText: options.displayText } : {}),
-        ...(options.voiceOperationId ? { voiceOperationId: options.voiceOperationId } : {}),
         ...(options.turnOrchestration ? { turnOrchestration: options.turnOrchestration } : {}),
         ...(attachmentItems ? { attachmentItems } : {}),
         ...(quotes && quotes.length > 0 ? { quotes: [...quotes] } : {}),

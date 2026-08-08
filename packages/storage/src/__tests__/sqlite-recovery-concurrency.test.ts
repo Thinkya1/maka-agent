@@ -33,6 +33,11 @@ interface WorkerHandle {
   output(): Pick<WorkerResult, 'stdout' | 'stderr'>;
 }
 
+// Race amplification (re-rolling the same interleaving many times) is stress
+// coverage, not contract coverage. Same gate the other multi-process storage
+// probes use, so there is one stress route rather than a flag per file.
+const RUN_RACE_AMPLIFICATION = process.env.MAKA_STORAGE_STRESS === '1';
+
 describe('SQLite recovery authority multi-process races', () => {
   it('makes an exact concurrent recovery bundle idempotent', async () => {
     await withPreparedDatabase(async ({ dbPath, startPath }) => {
@@ -164,7 +169,15 @@ describe('SQLite recovery authority multi-process races', () => {
   });
 
   it('allows concurrent operational owners to initialize the same fresh WAL database', async () => {
-    for (let round = 0; round < 12; round += 1) {
+    // One round proves the contract: two owners racing to initialize the same
+    // fresh database both succeed, and the result is a WAL database at the
+    // current schema version. Repetition does not make that assertion stronger
+    // — it re-rolls the scheduler hoping to catch a rarer interleaving, which
+    // is stress, not contract coverage. The extra rounds stay available on the
+    // storage stress route (MAKA_STORAGE_STRESS=1) alongside the other
+    // multi-process probes, and out of every ordinary run.
+    const rounds = RUN_RACE_AMPLIFICATION ? 12 : 1;
+    for (let round = 0; round < rounds; round += 1) {
       const root = await mkdtemp(join(tmpdir(), 'maka-operational-fresh-open-race-'));
       const dbPath = join(root, 'runtime.sqlite');
       const startPath = join(root, 'start');
@@ -255,7 +268,7 @@ describe('SQLite recovery authority multi-process races', () => {
       const db = new DatabaseSync(dbPath);
       try {
         db.exec(
-          "DROP TABLE runtime_partial_segments; DROP TABLE runtime_storage_root_binding; DROP TABLE runtime_workspace_heads; DROP TABLE runtime_workspace_versions; DROP TABLE runtime_workspace_epochs; DROP TABLE headless_task_run_events; DELETE FROM runtime_capabilities WHERE capability = 'runtime_workspace_version_authority'; PRAGMA user_version = 6;",
+          "DROP TABLE runtime_session_event_ordinals; DROP TABLE runtime_partial_segments; DROP TABLE runtime_storage_root_binding; DROP TABLE runtime_workspace_heads; DROP TABLE runtime_workspace_versions; DROP TABLE runtime_workspace_epochs; DROP TABLE headless_task_run_events; DELETE FROM runtime_capabilities WHERE capability = 'runtime_workspace_version_authority'; PRAGMA user_version = 6;",
         );
       } finally {
         db.close();

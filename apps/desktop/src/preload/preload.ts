@@ -6,10 +6,13 @@ import type {
   PermissionActionResult,
   PermissionOverlayStartResult,
   RendererIngestInput,
+  DesktopBranchFromTurnInput,
+  DesktopReviseBeforeTurnInput,
   AppUpdateInstallRequest,
   AppUpdateInstallResult,
   AppUpdateStatus,
   WindowCommand,
+  PetPackChangedEvent,
 } from './bridge-contract.js';
 import type {
   ConnectionEvent,
@@ -50,15 +53,17 @@ import type {
   UsageRange,
   UsageStats,
   E2eFixtureState,
+  GitReviewReadResult,
+  GitReviewMutationAction,
+  GitReviewMutationResult,
+  GitReviewSource,
   ArtifactBinaryReadResult,
   ArtifactChangedEvent,
   ArtifactDescriptor,
   ArtifactSaveResult,
   ArtifactTextReadResult,
-  BranchFromTurnInput,
   CapabilitySnapshotCollection,
   RegenerateTurnInput,
-  ReviseBeforeTurnInput,
   TurnRecord,
   PermissionSnapshot,
   LocalMemoryEntryPreview,
@@ -73,12 +78,6 @@ import type {
   DailyReviewArchive,
   DailyReviewArchiveSummary,
   QueueEnqueueOutcome,
-  VoiceBeginRequest,
-  VoiceBeginResult,
-  VoiceCapturedAudio,
-  VoiceCoordinatorToolCall,
-  VoiceFinishCaptureResult,
-  VoiceRealtimeClientSession,
   DailyReviewConfig,
   DailyReviewRange,
   DailyReviewSummary,
@@ -99,6 +98,8 @@ import type {
   AgentGraphClientSnapshotOptions,
   AgentGraphOperatorInspection,
   BotStatus,
+  ShellRunPtyDataEvent,
+  ShellRunPtySnapshot,
   WechatBridgeQrCodeResult,
 } from '@maka/runtime';
 import type { GoalState } from '@maka/runtime';
@@ -130,6 +131,32 @@ type LocalMemoryMutationResult =
   | { ok: false; state: LocalMemoryState; reason: string; message: string };
 
 const makaBridge = {
+  pets: {
+    list() {
+      return ipcRenderer.invoke('pets:list');
+    },
+    getSelection() {
+      return ipcRenderer.invoke('pets:getSelection');
+    },
+    select(petId: string | null) {
+      return ipcRenderer.invoke('pets:select', petId);
+    },
+    readSpriteSheet(petId: string) {
+      return ipcRenderer.invoke('pets:readSpriteSheet', petId);
+    },
+    remove(petId: string) {
+      return ipcRenderer.invoke('pets:remove', petId);
+    },
+    importLocalDirectory() {
+      return ipcRenderer.invoke('pets:importLocalDirectory');
+    },
+    subscribeChanges(handler: (event: PetPackChangedEvent) => void): () => void {
+      const listener = (_event: Electron.IpcRendererEvent, payload: PetPackChangedEvent) =>
+        handler(payload);
+      ipcRenderer.on('pets:changed', listener);
+      return () => ipcRenderer.off('pets:changed', listener);
+    },
+  },
   tasks: {
     list(sessionId: string): Promise<Task[]> {
       return ipcRenderer.invoke('tasks:list', sessionId);
@@ -203,7 +230,6 @@ const makaBridge = {
             turnId: string;
             text: string;
             displayText?: string;
-            voiceOperationId?: string;
             skillIds?: string[];
             attachmentItems?: RendererIngestInput[];
             turnOrchestration?: TurnOrchestration;
@@ -260,10 +286,10 @@ const makaBridge = {
     regenerateTurn(sessionId: string, input: RegenerateTurnInput): Promise<void> {
       return ipcRenderer.invoke('sessions:regenerateTurn', sessionId, input);
     },
-    branchFromTurn(sessionId: string, input: BranchFromTurnInput): Promise<SessionSummary> {
+    branchFromTurn(sessionId: string, input: DesktopBranchFromTurnInput): Promise<SessionSummary> {
       return ipcRenderer.invoke('sessions:branchFromTurn', sessionId, input);
     },
-    reviseBeforeTurn(sessionId: string, input: ReviseBeforeTurnInput): Promise<SessionSummary> {
+    reviseBeforeTurn(sessionId: string, input: DesktopReviseBeforeTurnInput): Promise<SessionSummary> {
       return ipcRenderer.invoke('sessions:reviseBeforeTurn', sessionId, input);
     },
     respondToSandboxBoundary(sessionId: string, response: SandboxBoundaryResponse): Promise<void> {
@@ -369,8 +395,11 @@ const makaBridge = {
     remove(sessionId: string, options?: { revisionFamily?: boolean }): Promise<void> {
       return ipcRenderer.invoke('sessions:remove', sessionId, options);
     },
-    cleanupQuoteCompanion(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('sessions:cleanupQuoteCompanion', sessionId);
+    cleanupSessionCopy(sessionId: string): Promise<void> {
+      return ipcRenderer.invoke('sessions:cleanupSessionCopy', sessionId);
+    },
+    abandonSessionCopy(sessionId: string): Promise<void> {
+      return ipcRenderer.invoke('sessions:abandonSessionCopy', sessionId);
     },
   },
   projects: {
@@ -392,6 +421,15 @@ const makaBridge = {
     > {
       return ipcRenderer.invoke('projects:relink', projectId);
     },
+    reveal(projectId: string): Promise<
+      | { ok: true; opened: string }
+      | {
+          ok: false;
+          reason: 'unknown-key' | 'not-allowed' | 'missing' | 'not-a-directory' | 'open-failed';
+        }
+    > {
+      return ipcRenderer.invoke('projects:reveal', projectId);
+    },
     rename(projectId: string, name: string): Promise<ProjectRecord> {
       return ipcRenderer.invoke('projects:rename', projectId, name);
     },
@@ -406,10 +444,57 @@ const makaBridge = {
     list(sessionId: string): Promise<ShellRunUpdate[]> {
       return ipcRenderer.invoke('shell-runs:list', sessionId);
     },
+    attach(input: {
+      sessionId: string;
+      ref: string;
+    }): Promise<ShellRunPtySnapshot | null> {
+      return ipcRenderer.invoke('shell-runs:attach', input);
+    },
+    start(sessionId: string): Promise<ShellRunUpdate> {
+      return ipcRenderer.invoke('shell-runs:start', sessionId);
+    },
+    write(input: {
+      sessionId: string;
+      ref: string;
+      input?: string;
+      size?: { cols: number; rows: number };
+    }): Promise<ShellRunUpdate | null> {
+      return ipcRenderer.invoke('shell-runs:write', input);
+    },
+    stop(input: {
+      sessionId: string;
+      ref: string;
+    }): Promise<ShellRunUpdate | null> {
+      return ipcRenderer.invoke('shell-runs:stop', input);
+    },
     subscribeUpdates(handler: (update: ShellRunUpdate) => void): () => void {
       const listener = (_event: Electron.IpcRendererEvent, update: ShellRunUpdate) => handler(update);
       ipcRenderer.on('shell-runs:update', listener);
       return () => ipcRenderer.off('shell-runs:update', listener);
+    },
+    subscribePtyData(handler: (event: ShellRunPtyDataEvent) => void): () => void {
+      const listener = (_event: Electron.IpcRendererEvent, payload: ShellRunPtyDataEvent) =>
+        handler(payload);
+      ipcRenderer.on('shell-runs:pty-data', listener);
+      return () => ipcRenderer.off('shell-runs:pty-data', listener);
+    },
+  },
+  gitReview: {
+    read(input: {
+      sessionId: string;
+      source: GitReviewSource;
+      baseBranch?: string;
+    }): Promise<GitReviewReadResult> {
+      return ipcRenderer.invoke('git-review:read', input);
+    },
+    mutate(input: {
+      sessionId: string;
+      source: Extract<GitReviewSource, 'unstaged' | 'staged'>;
+      revision: string;
+      path: string;
+      action: GitReviewMutationAction;
+    }): Promise<GitReviewMutationResult> {
+      return ipcRenderer.invoke('git-review:mutate', input);
     },
   },
   goal: {
@@ -593,6 +678,14 @@ const makaBridge = {
       | { ok: false; reason: 'cancelled' }
     > {
       return ipcRenderer.invoke('attachments:pickFiles');
+    },
+    // Staged-attachment thumbnail for the composer drawer. Peeks the approval
+    // (never consumes it) so the token stays redeemable for the actual send.
+    previewApproval(approvalId: string): Promise<
+      | { ok: true; base64: string; mimeType: string }
+      | { ok: false; reason: string }
+    > {
+      return ipcRenderer.invoke('attachments:previewApproval', approvalId);
     },
     readBytes(sessionId: string, relativePath: string): Promise<
       | { ok: true; base64: string; mimeType: string }
@@ -873,29 +966,6 @@ const makaBridge = {
       },
     },
   },
-  voice: {
-    begin(input: VoiceBeginRequest): Promise<VoiceBeginResult> {
-      return ipcRenderer.invoke('voice:begin', input);
-    },
-    finishCapture(
-      operationId: string,
-      audio: VoiceCapturedAudio,
-    ): Promise<VoiceFinishCaptureResult> {
-      return ipcRenderer.invoke('voice:finishCapture', operationId, audio);
-    },
-    cancel(operationId: string): Promise<void> {
-      return ipcRenderer.invoke('voice:cancel', operationId);
-    },
-    createRealtimeSession(offerSdp: string): Promise<VoiceRealtimeClientSession> {
-      return ipcRenderer.invoke('voice:createRealtimeSession', offerSdp);
-    },
-    closeRealtimeSession(sessionId: string): Promise<void> {
-      return ipcRenderer.invoke('voice:closeRealtimeSession', sessionId);
-    },
-    validateCoordinatorToolCall(input: unknown): Promise<VoiceCoordinatorToolCall> {
-      return ipcRenderer.invoke('voice:validateCoordinatorToolCall', input);
-    },
-  },
   notifications: {
     // Fire-and-forget signal that an agent turn reached a terminal
     // state. `title` is the session name, `body` the start of the reply
@@ -1022,6 +1092,7 @@ const makaBridge = {
       arch: string;
       osRelease: string;
       workspacePath: string;
+      homePath: string;
       projectId?: string | null;
       projectPath: string;
       projectGit: { isGitRepo: boolean; branch?: string };
@@ -1043,9 +1114,6 @@ const makaBridge = {
     },
     installUpdate(input: AppUpdateInstallRequest): Promise<AppUpdateInstallResult> {
       return ipcRenderer.invoke('app:installUpdate', input);
-    },
-    openUpdateDownload(): Promise<{ ok: true } | { ok: false; reason: 'not_available' | 'open_failed' }> {
-      return ipcRenderer.invoke('app:openUpdateDownload');
     },
     sessionProjectInfo(sessionId: string): Promise<{
       projectPath: string;

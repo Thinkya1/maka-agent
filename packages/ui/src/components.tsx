@@ -11,6 +11,7 @@ export type { ModuleHubHeader } from './module-hub-selector.js';
 export { SearchModal } from './search-modal.js';
 export { SessionListPanel } from './session-list-panel.js';
 export type { SessionViewMode } from './session-list-panel.js';
+export type { SidebarUpdateReminder } from './session-sidebar-nav.js';
 export type { BundledSkillCatalogEntry, DailyReviewMarkdownActionInput, ManagedSkillSourceEntry, ManagedSkillUpdatePreview, SkillEntry, SkillGovernanceDetails } from './module-panel-types.js';
 export { describeLoadToolResult, formatRedactedJson, formatToolIntent, loadToolDisplayName } from './tool-format.js';
 export { formatBytes, ToolCallDetail, ToolTrow } from './tool-activity.js';
@@ -21,6 +22,14 @@ export type { ChatSurfaceLayoutProps } from './chat-surface-layout.js';
 export { ChatView } from './chat-view.js';
 export { WorkspacePicker } from './workspace-picker.js';
 export type { WorkspacePickerModel } from './workspace-picker.js';
+export {
+  deriveTitlebarProjectName,
+  TitlebarSessionIdentity,
+} from './titlebar-session-identity.js';
+export type {
+  TitlebarParentSession,
+  TitlebarProject,
+} from './titlebar-session-identity.js';
 export type {
   TurnFooterActionMeta,
   TurnLineageBadge,
@@ -29,7 +38,10 @@ export type {
 } from './chat-turn.js';
 export { AutomationsPage, DailyReviewPage, SkillsPage } from './module-pages.js';
 export { Composer } from './composer.js';
-export type { ComposerHandle } from './composer.js';
+export type {
+  ComposerHandle,
+  ComposerSlashCommandOption,
+} from './composer.js';
 export {
   getPermissionModeMeta,
   PERMISSION_MODE_ORDER,

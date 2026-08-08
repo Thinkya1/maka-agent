@@ -1,15 +1,22 @@
 import type { Meta, StoryObj } from '@storybook/react-vite';
-import { useState, type ReactNode } from 'react';
+import { useState, type CSSProperties, type ReactNode } from 'react';
 import type { ComponentProps } from 'react';
-import { projectRevisionLinkedSessionTree } from '@maka/core';
 import type { ProjectRecord, SessionSummary, StoredMessage } from '@maka/core';
-import { ChatSurfaceLayout, ChatView, Composer, SessionListPanel } from '@maka/ui';
+import {
+  ChatSurfaceLayout,
+  ChatView,
+  Composer,
+  deriveTitlebarProjectName,
+  SessionListPanel,
+  TitlebarSessionIdentity,
+} from '@maka/ui';
 import type { ChatModelChoice, SessionViewMode, TurnViewModel } from '@maka/ui';
 import { AppShellTopbarActions, AppShellWorkspaceTopActions } from '../src/renderer/app-shell-chrome-actions';
 import { AppShellDetailPanel } from '../src/renderer/app-shell-detail-panel';
 import { deriveAppShellTurnPresentation } from '../src/renderer/app-shell-turn-view-model';
 import { deriveBranchBanner } from '../src/renderer/branch-banner';
 import { deriveSessionRevisionNavigation } from '../src/renderer/session-revisions';
+import { deriveSessionRail } from '../src/renderer/session-rail';
 import { AppShell as AstryxAppShell } from '@astryxdesign/core/AppShell';
 
 const NOW = Date.UTC(2026, 6, 1, 9, 30, 0);
@@ -38,14 +45,20 @@ const modelChoices: ChatModelChoice[] = [
   {
     connectionSlug: 'anthropic-main',
     providerType: 'anthropic',
+    providerLabel: 'Anthropic',
     model: 'claude-sonnet-4-5',
     label: 'Claude Sonnet 4.5',
+    isDefault: true,
+    thinkingLevels: [],
   },
   {
     connectionSlug: 'openai-main',
     providerType: 'openai',
+    providerLabel: 'OpenAI',
     model: 'gpt-5.1',
     label: 'GPT-5.1',
+    isDefault: true,
+    thinkingLevels: [],
   },
 ];
 
@@ -226,7 +239,21 @@ function ShellFrame(props: {
          Storybook while the app dropped it — and these stories are the pixel
          review surface, so the drift lands exactly where it is trusted. */
       data-sidebar-state={props.sidebarCollapsed ? 'collapsed' : 'expanded'}
-      style={{ height: '100%', minHeight: 640 }}
+      style={
+        {
+          height: '100%',
+          minHeight: 640,
+          /* Same publication point as production, for the same reason as
+             `data-sidebar-state` above: the titlebar's first grid track is a
+             `calc()` on this variable, and an unset variable makes the whole
+             track list invalid — the breadcrumb then parks against the icon
+             rail instead of the plate seam, so the seam and truncation stories
+             would be reviewing a layout the app never renders. Collapsed is
+             left to the CSS rule, exactly as in the app.
+             `SessionListPanel`'s own default width. */
+          ...(props.sidebarCollapsed ? null : { '--maka-sidenav-width': '260px' }),
+        } as CSSProperties
+      }
     >
       {props.children}
     </div>
@@ -265,6 +292,8 @@ function ComposedShell(props: {
    * supplying the relatives, not by hand-writing what the helpers would return.
    */
   relatedSessions?: SessionSummary[];
+  /** Drives the footer's update action; `undefined` is the silent phase. */
+  updateReminder?: SessionListPanelProps['updateReminder'];
 }) {
   const [collapsed, setCollapsed] = useState(props.sidebarCollapsed ?? false);
   const [viewMode, setViewMode] = useState<SessionViewMode>(props.initialViewMode ?? 'conversation');
@@ -286,11 +315,9 @@ function ComposedShell(props: {
   // showing lineage the production rules would not produce for its sessions.
   const branchBanner = deriveBranchBanner(active, sessions);
   const revisionNavigation = deriveSessionRevisionNavigation(sessions, active?.id);
-  // The sidebar shows logical conversations, not physical revisions: production
-  // collapses each family to one row before rendering. Passing the raw list
-  // would put three rows where the app shows one.
-  const sessionTree = projectRevisionLinkedSessionTree(sessions, active?.id);
-  const sidebarRows = sessionTree.roots;
+  // Same rail projection as app-shell: revision-tree roots only (linked
+  // children stay off the list). Stories include every fixture row.
+  const { sessions: sidebarRows } = deriveSessionRail(sessions, active?.id, () => true);
   const messages = props.chat?.messages ?? baseChatProps.messages;
   // ChatView projects the transcript and calls this back with the turns, the
   // same seam production uses (app-shell.tsx), so a story cannot show footer
@@ -317,9 +344,27 @@ function ComposedShell(props: {
           onToggleSidebar={() => setCollapsed((current) => !current)}
           onOpenSearchModal={noop}
         />
+        {/* Derived from the same session and project catalog the sidebar reads,
+            not hand-passed: a story cannot show a project the session does not
+            belong to. Absent for the 新任务 state, where production has no
+            session to name. */}
+        {active && (
+          <TitlebarSessionIdentity
+            sessionName={active.name}
+            onRenameSession={noop}
+            project={(() => {
+              const name = deriveTitlebarProjectName({
+                projectName: catalogProjects.find((item) => item.id === active.projectId)?.name,
+                projectPath: active.cwd,
+              });
+              return name ? { name, onOpenFolder: noop } : undefined;
+            })()}
+          />
+        )}
         <AppShellWorkspaceTopActions
           workbarAvailable
           workbarCollapsed={false}
+          onOpenWorkbarLauncher={noop}
           onToggleWorkbar={noop}
         />
       </header>
@@ -343,7 +388,6 @@ function ComposedShell(props: {
             maxWidth={480}
             selection={{ section: 'sessions', filter: 'chats' }}
             sessions={sidebarRows}
-            childSessionsByParentId={sessionTree.childrenByParentId}
             activeId={active?.id}
             groups={viewMode === 'project' ? projectGroups : undefined}
             streamingSessionIds={streamingIds}
@@ -352,6 +396,8 @@ function ComposedShell(props: {
             onSelect={noop}
             onSelectSession={noop}
             onOpenSettings={noop}
+            updateReminder={props.updateReminder}
+            onOpenUpdate={noop}
             onNew={noop}
             rowActions={sidebarRowActions}
             projectActions={projectRowActions}
@@ -400,6 +446,28 @@ export const DefaultLayout: Story = {
   render: () => <ComposedShell />,
 };
 
+// Real path: the updater finishes downloading in the background (autoDownload
+// is on) → the footer's settings row grows an accent update button. Discovery
+// and download show nothing, so this is the first moment the shell says
+// anything about an update at all.
+export const UpdateDownloaded: Story = {
+  render: () => <ComposedShell updateReminder={{ state: 'downloaded', latestVersion: '0.1.7' }} />,
+};
+
+// Real path: the same download fails → same slot, muted variant, retry.
+export const UpdateFailed: Story = {
+  render: () => <ComposedShell updateReminder={{ state: 'error', latestVersion: '0.1.7' }} />,
+};
+
+// Real path: an update is waiting while the rail is collapsed to 48px. The row
+// cannot hold two controls side by side there, so it stacks — off the frame's
+// own `data-sidebar-state`, which is why ShellFrame above has to carry it.
+export const UpdateDownloadedCollapsed: Story = {
+  render: () => (
+    <ComposedShell sidebarCollapsed updateReminder={{ state: 'downloaded', latestVersion: '0.1.7' }} />
+  ),
+};
+
 // Real path: send a message → the turn is streaming (composer shows the
 // stop button and the streaming hint).
 export const StreamingTurn: Story = {
@@ -407,6 +475,7 @@ export const StreamingTurn: Story = {
     <ComposedShell
       session={{ status: 'running', streaming: true }}
       chat={{
+        runningStatus: true,
         messages: [
           user('msg-s-1', 'turn-s', 3, '顶层布局的 story 怎么做最稳？'),
           { type: 'turn_state', id: 'state-s', turnId: 'turn-s', ts: NOW - 30_000, status: 'running', partialOutputRetained: false },
@@ -416,6 +485,44 @@ export const StreamingTurn: Story = {
             stepId: 'msg-assistant-s',
             text: { text: '直接挂载 Astryx AppShell，通过官方插槽组合真实产品子组件，只隔离 IPC。', truncated: false, complete: false },
             tools: [],
+          }],
+        },
+      }}
+    />
+  ),
+};
+
+// Real path: ask for something long-running → a tool has been going for
+// minutes and the model has produced nothing to look at. The cue this replaced
+// was hidden exactly here — it only covered the gap before the first content
+// event — so this state used to offer no evidence the harness was still
+// working.
+//
+// What renders is the frozen form: the shell frame carries the e2e-fixture
+// attribute, and the elapsed clock is dropped rather than pinned under it,
+// because any value it could print is a real wall-clock difference that would
+// differ between two captures. In the app the same row reads
+// "正在琢磨… · 2m 1s", with the phrase swapping every 20s.
+export const RunningStatusDuringToolRun: Story = {
+  render: () => (
+    <ComposedShell
+      session={{ status: 'running', streaming: true }}
+      chat={{
+        runningStatus: true,
+        messages: [
+          user('msg-t-1', 'turn-t', 2, '把整个测试套件跑一遍，看看那三个失败用例是不是同一个原因。'),
+          { type: 'turn_state', id: 'state-t', turnId: 'turn-t', ts: NOW - 120_000, status: 'running', partialOutputRetained: false },
+        ],
+        liveTurn: {
+          turnId: 'turn-t', phase: 'streamed', steps: [{
+            stepId: 'msg-assistant-t',
+            tools: [{
+              toolUseId: 'tool-t-1',
+              toolName: 'Bash',
+              activityKind: 'command',
+              status: 'running',
+              args: { command: 'npm test' },
+            }],
           }],
         },
       }}
@@ -471,6 +578,28 @@ export const NewChatComposer: Story = {
         newChatModel: { llmConnectionSlug: 'anthropic-main', model: 'claude-sonnet-4-5' },
         onPickNewChatModel: noop,
         onOpenModelSettings: noop,
+      }}
+    />
+  ),
+};
+
+// Real path: 新任务 → 切换项目 → 项目 picker 处于 pending（切换中）。
+// Production passes `pending: projectPickerPending` while a project switch is
+// in flight; the trigger locks with a spinner and every menu row disables,
+// matching the model switcher's mid-switch treatment.
+export const NewChatComposerProjectPending: Story = {
+  render: () => (
+    <ComposedShell
+      session={null}
+      chat={{ messages: [] }}
+      composer={{
+        newChatModel: { llmConnectionSlug: 'anthropic-main', model: 'claude-sonnet-4-5' },
+        onPickNewChatModel: noop,
+        onOpenModelSettings: noop,
+        workspacePicker: {
+          ...baseComposerProps.workspacePicker!,
+          pending: true,
+        },
       }}
     />
   ),
@@ -643,9 +772,6 @@ export const NativeConversation: Story = {
           },
         ],
         onRemoveAttachment: noop,
-        onToggleVoiceCapture: noop,
-        onToggleRealtimeVoice: noop,
-        voiceProviderLabel: '系统语音',
       }}
     />
   ),
@@ -736,6 +862,32 @@ export const SessionContextLayer: Story = {
         },
         onBranchBannerClick: noop,
         onRevisionNavigate: noop,
+      }}
+    />
+  ),
+};
+
+// The titlebar states the session's identity in every session view, so the
+// stories above already show its ordinary state. These two cover what they
+// cannot: a session with no directory to name, and a name long enough to reach
+// the action cluster.
+
+// Real path: a session started before any project was picked. The breadcrumb
+// collapses to the session name — a leading empty crumb would read as a project
+// whose name failed to load.
+export const TitlebarIdentityWithoutProject: Story = {
+  render: () => <ComposedShell session={{ projectId: null, cwd: undefined }} />,
+};
+
+// Real path: a long auto-generated session name, sidebar collapsed so the
+// identity sits closest to the conversation column. It must truncate itself
+// rather than push the workbar toggle off the strip.
+export const TitlebarIdentityTruncated: Story = {
+  render: () => (
+    <ComposedShell
+      sidebarCollapsed
+      session={{
+        name: 'Chat Surface 会话上下文在极窄窗口中的响应式收敛与信息优先级验证',
       }}
     />
   ),

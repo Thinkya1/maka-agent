@@ -20,7 +20,7 @@ import {
   AGENT_LIST_TOOL_NAME,
   AGENT_OUTPUT_TOOL_NAME,
   AGENT_SPAWN_TOOL_NAME,
-  AGENT_SWARM_TOOL_NAME,
+  AGENT_SWARM_STATUS_TOOL_NAME,
   AGENT_TOOL_GROUP_ID,
   GOAL_CLEAR_TOOL_NAME,
   GOAL_PAUSE_TOOL_NAME,
@@ -43,6 +43,7 @@ import {
   isMakaClaudeSubscriptionCloakEnabled,
   resolveCliStreamConnectTimeoutMs,
 } from '../runtime-bootstrap.js';
+import { WAIT_BUDGET_MS } from './tui-terminal-mock.js';
 
 function modelCallAttemptFixture(): ModelCallAttempt {
   return {
@@ -693,9 +694,9 @@ describe('Maka CLI runtime bootstrap', () => {
               description: 'Spawn, fan out, and inspect foreground child agents.',
               toolNames: [
                 AGENT_SPAWN_TOOL_NAME,
-                AGENT_SWARM_TOOL_NAME,
                 AGENT_LIST_TOOL_NAME,
                 AGENT_OUTPUT_TOOL_NAME,
+                AGENT_SWARM_STATUS_TOOL_NAME,
                 VIEW_AGENT_GRAPH_TOOL_NAME,
                 UPDATE_AGENT_GRAPH_TOOL_NAME,
                 YIELD_AGENT_GRAPH_TOOL_NAME,
@@ -708,9 +709,7 @@ describe('Maka CLI runtime bootstrap', () => {
           ['Read', 'Glob', 'Grep', 'WebSearch', 'Write', 'Edit', 'Bash'],
         );
         assert.equal(
-          runtimeDeps.childTools?.some((tool) =>
-            [AGENT_SPAWN_TOOL_NAME, AGENT_SWARM_TOOL_NAME].includes(tool.name),
-          ),
+          runtimeDeps.childTools?.some((tool) => tool.name === AGENT_SPAWN_TOOL_NAME),
           false,
         );
         const childAgents = (await backendInput.listChildAgents?.()) as {
@@ -735,7 +734,7 @@ describe('Maka CLI runtime bootstrap', () => {
           { status: 'unavailable', reason: 'missing_tools', missingTools: ['WebSearch'] },
         );
         assert.equal(context.skills.host.toolNames.has(AGENT_SPAWN_TOOL_NAME), true);
-        assert.equal(context.skills.host.toolNames.has(AGENT_SWARM_TOOL_NAME), true);
+        assert.equal(context.skills.host.toolNames.has('agent_swarm'), false);
       } finally {
         await context.close();
       }
@@ -1364,7 +1363,11 @@ async function withWorkspace(fn: (workspaceRoot: string) => Promise<void>): Prom
 }
 
 async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>): Promise<T> {
-  const deadline = Date.now() + 3_000;
+  // Same budget policy as the shared TUI waitFor (#2221): the wait returns as
+  // soon as the read yields a value, so the floor only bounds a failing
+  // report, and CI runners get the scaled budget instead of losing
+  // scheduling races.
+  const deadline = Date.now() + Math.max(3_000, WAIT_BUDGET_MS);
   while (Date.now() < deadline) {
     const value = await read();
     if (value !== undefined) return value;

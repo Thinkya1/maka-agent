@@ -9,6 +9,8 @@ import {
   canonicalToolArgsHash,
   createRuntimeBoundaryCursor,
   runtimePrefixSegment,
+  ToolLedgerCorruptionError,
+  ToolLedgerRejectionError,
   type ContinuationClaimV1,
   type ImmutableRuntimePrefixV1,
   type RuntimeEvent,
@@ -49,6 +51,7 @@ describe('SqliteRuntimeStore', () => {
       const legacy = new DatabaseSync(dbPath);
       legacy.exec(`
         DROP TABLE runtime_partial_segments;
+        DROP TABLE runtime_session_event_ordinals;
         DROP TABLE runtime_storage_root_binding;
         DROP TABLE runtime_workspace_heads;
         DROP TABLE runtime_workspace_versions;
@@ -67,6 +70,9 @@ describe('SqliteRuntimeStore', () => {
           await upgraded.readImmutableRuntimeEvents(historical.sessionId, historical.runId),
           [historical],
         );
+        assert.deepEqual(await upgraded.readSessionRuntimeEventEntries(historical.sessionId), [
+          { ordinal: 1, event: historical },
+        ]);
         const inspect = new DatabaseSync(dbPath);
         try {
           const columns = inspect
@@ -150,7 +156,11 @@ describe('SqliteRuntimeStore', () => {
 
       const legacy = new DatabaseSync(dbPath);
       legacy.prepare(`UPDATE runtime_partial_snapshots SET text_content = 'old'`).run();
-      legacy.exec('DROP TABLE runtime_partial_segments; PRAGMA user_version = 9;');
+      legacy.exec(`
+        DROP TABLE runtime_partial_segments;
+        DROP TABLE runtime_session_event_ordinals;
+        PRAGMA user_version = 9;
+      `);
       legacy.close();
 
       const upgraded = createSqliteRuntimeStore(dbPath);
@@ -172,6 +182,98 @@ describe('SqliteRuntimeStore', () => {
     });
   });
 
+  it('backfills schema 10 Session ordinals in SQLite insertion order', async () => {
+    await withStore(async (store, dbPath) => {
+      const first = functionCallEvent({ id: 'legacy-first', ts: 20 });
+      const second = functionCallEvent({
+        id: 'legacy-second',
+        invocationId: 'invocation-2',
+        runId: 'run-2',
+        turnId: 'turn-2',
+        ts: 10,
+      });
+      await store.appendRuntimeEvent(first.sessionId, first.runId, first);
+      await store.appendRuntimeEvent(second.sessionId, second.runId, second);
+      store.close();
+
+      const legacy = new DatabaseSync(dbPath);
+      legacy.exec(`
+        DROP TABLE runtime_session_event_ordinals;
+        PRAGMA user_version = 10;
+      `);
+      legacy.close();
+
+      const upgraded = createSqliteRuntimeStore(dbPath);
+      try {
+        assert.deepEqual(
+          (await upgraded.readSessionRuntimeEventEntries(first.sessionId)).map(
+            ({ ordinal, event }) => ({ ordinal, eventId: event.id }),
+          ),
+          [
+            { ordinal: 1, eventId: first.id },
+            { ordinal: 2, eventId: second.id },
+          ],
+        );
+        const third = functionCallEvent({
+          id: 'legacy-third',
+          invocationId: 'invocation-3',
+          runId: 'run-3',
+          turnId: 'turn-3',
+          ts: 5,
+        });
+        await upgraded.appendRuntimeEvent(third.sessionId, third.runId, third);
+        assert.equal(
+          (await upgraded.readSessionRuntimeEventEntries(first.sessionId)).at(-1)?.ordinal,
+          3,
+        );
+      } finally {
+        upgraded.close();
+      }
+    });
+  });
+
+  it('assigns stable Session ordinals in commit order across Runs', async () => {
+    await withStore(async (store, dbPath) => {
+      const first = functionCallEvent({ id: 'ordinal-1', ts: 20 });
+      const second = functionCallEvent({
+        id: 'ordinal-2',
+        invocationId: 'invocation-2',
+        runId: 'run-2',
+        turnId: 'turn-2',
+        ts: 10,
+      });
+      await store.appendRuntimeEvent(first.sessionId, first.runId, first);
+      await store.appendRuntimeEvent(second.sessionId, second.runId, second);
+      await store.appendRuntimeEvent(first.sessionId, first.runId, first);
+
+      assert.deepEqual(
+        (await store.readSessionRuntimeEventEntries('session-1')).map(({ ordinal, event }) => ({
+          ordinal,
+          eventId: event.id,
+        })),
+        [
+          { ordinal: 1, eventId: 'ordinal-1' },
+          { ordinal: 2, eventId: 'ordinal-2' },
+        ],
+      );
+
+      store.close();
+      const reopened = createSqliteRuntimeStore(dbPath);
+      try {
+        assert.deepEqual(
+          (await reopened.readSessionRuntimeEventEntries('session-1')).map(
+            ({ ordinal, event }) => ({ ordinal, eventId: event.id }),
+          ),
+          [
+            { ordinal: 1, eventId: 'ordinal-1' },
+            { ordinal: 2, eventId: 'ordinal-2' },
+          ],
+        );
+      } finally {
+        reopened.close();
+      }
+    });
+  });
   it('makes a raw canonical-equivalent terminal durability retry idempotent', async () => {
     await withStore(async (store) => {
       const terminal: RuntimeEvent = {
@@ -220,6 +322,80 @@ describe('SqliteRuntimeStore', () => {
         (await store.readToolJournal('operation-1')).map((event) => event.state),
         ['prepared', 'outcome_committed'],
       );
+    });
+  });
+
+  // These two pin the ERROR CLASS, not the message. AgentRun exempts exactly
+  // one class from the store-unavailable latch (`ToolLedgerRejectionError`), so
+  // the class is a behavioural contract between storage and runtime — and both
+  // messages are byte-identical to the plain `Error` strings they replaced, so
+  // a regression to `throw new Error(...)` would leave every message-matching
+  // assertion in this suite green while the exemption silently stopped working.
+  it('rejects an inadmissible candidate with ToolLedgerRejectionError, naming the code', async () => {
+    await withStore(async (store) => {
+      // Untagged, so it takes the generic lane — a tagged response is a
+      // reserved boundary fact and never reaches the transition check. This is
+      // the exact shape #2234 produced: a result with no call to answer.
+      const orphan = functionResponseEvent({
+        id: 'orphan-response-event',
+        ts: 11,
+        refs: { toolCallId: 'provider-call-1' },
+      });
+      await assert.rejects(
+        store.appendRuntimeEvent(orphan.sessionId, orphan.runId, orphan),
+        (error: unknown) =>
+          error instanceof ToolLedgerRejectionError &&
+          error.code === 'orphan_response' &&
+          error.eventId === 'orphan-response-event',
+      );
+    });
+  });
+
+  it('reports pre-existing damage as ToolLedgerCorruptionError, even from another session', async () => {
+    await withStore(async (store, dbPath) => {
+      store.close();
+
+      // Seed damage the store would never have written itself, in a session
+      // this run never touches: the health scan has no WHERE clause, so one
+      // damaged operation anywhere in the workspace is what a later append meets.
+      const raw = new DatabaseSync(dbPath);
+      const stranded = functionResponseEvent({
+        id: 'stranded-response',
+        sessionId: 'some-other-session',
+        invocationId: 'some-other-invocation',
+        runId: 'some-other-run',
+        ts: 5,
+      });
+      raw
+        .prepare(`
+          INSERT INTO runtime_events
+            (event_id, session_id, invocation_id, run_id, turn_id, event_seq, event_kind,
+             payload_json, committed_at)
+          VALUES (?, ?, ?, ?, ?, 1, 'function_response', ?, 5)
+        `)
+        .run(
+          stranded.id,
+          stranded.sessionId,
+          stranded.invocationId,
+          stranded.runId,
+          stranded.turnId,
+          JSON.stringify(stranded),
+        );
+      raw.close();
+
+      const reopened = createSqliteRuntimeStore(dbPath);
+      try {
+        const healthy = functionCallEvent();
+        await assert.rejects(
+          reopened.appendRuntimeEvent(healthy.sessionId, healthy.runId, healthy),
+          (error: unknown) =>
+            error instanceof ToolLedgerCorruptionError &&
+            !(error instanceof ToolLedgerRejectionError) &&
+            error.code === 'orphan_response',
+        );
+      } finally {
+        reopened.close();
+      }
     });
   });
 

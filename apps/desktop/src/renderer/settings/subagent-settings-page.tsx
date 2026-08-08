@@ -14,13 +14,11 @@
 import { useId, useMemo, useRef, useState } from 'react';
 import { Banner, HStack, VStack } from '@astryxdesign/core';
 import {
-  connectionEnabledModelIds,
   isSafeSubagentPresetId,
   MAX_SUBAGENT_PRESETS,
   SUBAGENT_PRESET_DESCRIPTION_MAX_CHARS,
   SUBAGENT_PRESET_ID_MAX_CHARS,
   SUBAGENT_PRESET_NAME_MAX_CHARS,
-  thinkingVariantsForModel,
   type AppSettings,
   type LlmConnection,
   type SubagentPreset,
@@ -28,6 +26,8 @@ import {
   type ThinkingLevel,
   type UpdateAppSettingsResult,
 } from '@maka/core';
+import { connectionEnabledModelIds } from '@maka/core/llm-connections';
+import { thinkingVariantsForConnection } from '@maka/core/model-thinking';
 import {
   Badge,
   Button,
@@ -349,7 +349,7 @@ function SubagentPresetEditor(props: {
     ? connectionEnabledModelIds(selectedConnection)
     : [];
   const thinkingLevels = selectedConnection
-    ? thinkingVariantsForModel(selectedConnection.providerType, draft.model)
+    ? thinkingVariantsForConnection(selectedConnection, draft.model)
     : [];
   const profileCopy = copy.profiles[draft.profile];
   const validId = isSafeSubagentPresetId(draft.id.trim());

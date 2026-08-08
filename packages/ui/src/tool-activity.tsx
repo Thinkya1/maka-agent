@@ -159,7 +159,13 @@ function AutomationResultPreview(props: { text: string }) {
  * row's expansion state internally — this panel is the seam where the product
  * decides what a result looks like, and it is asserted directly.
  */
-export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
+export function ToolCallDetail({
+  item,
+  onOpenLinkedSession,
+}: {
+  item: ToolActivityItem;
+  onOpenLinkedSession?(sessionId: string): void;
+}) {
   const locale = useUiLocale();
   const cancelled = isCancelledToolResult(item.result);
   const sandboxBlocked = isSandboxDeniedTool(item);
@@ -223,6 +229,7 @@ export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
             toolName={item.toolName}
             args={item.args}
             shellRunSource={item.shellRunSource}
+            onOpenLinkedSession={onOpenLinkedSession}
           />
         )
       )}
@@ -265,7 +272,13 @@ export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
               return <ToolCodeBlock code={invocationLine} />;
             }
             if (showResult && !ownsPanel && displayResult) {
-              return <ToolResultPreview content={displayResult} toolName={item.toolName} />;
+              return (
+                <ToolResultPreview
+                  content={displayResult}
+                  toolName={item.toolName}
+                  onOpenLinkedSession={onOpenLinkedSession}
+                />
+              );
             }
             if (showInvocation && invocationLine) {
               return <ToolCodeBlock code={invocationLine} />;
@@ -285,47 +298,69 @@ export function ToolCallDetail({ item }: { item: ToolActivityItem }) {
  * their own word in `errorMessage`, and the detail panel (banner, command,
  * output, previews) rides along in `resultDetail`.
  */
-export function ToolTrow({ items }: { items: ToolActivityItem[] }) {
+export function ToolTrow({
+  items,
+  onOpenLinkedSession,
+}: {
+  items: ToolActivityItem[];
+  onOpenLinkedSession?(sessionId: string): void;
+}) {
   const locale = useUiLocale();
   if (items.length === 0) return null;
-  const calls: ChatToolCallItem[] = items.map((item) => {
-    const diffStats =
-      item.result?.kind === 'file_diff' ? diffRowStats(item.result.diff) : undefined;
-    return {
-      key: item.toolUseId,
-      // The name is what a person reads to tell one call from the next, and for
-      // Computer Use the display name is "Maka Computer" — a noun, identical on
-      // every row of a ten-call turn. A label derived from the call's own
-      // arguments says what happened instead.
-      name: computerActionLabel(item, locale) ?? resolveToolDisplayName(item, locale),
-      status: astryxToolStatus(item),
-      target: item.intent ? formatToolIntent(item.intent) : undefined,
-      duration: formatDuration(item.durationMs) ?? undefined,
-      errorMessage: toolCallErrorMessage(item, locale),
-      stats: outcomeWord(item, locale),
-      ...(diffStats ?? {}),
-      resultDetail: (
-        <ToolDetailReveal>
-          <ToolCallDetail item={item} />
-        </ToolDetailReveal>
-      ),
-    };
-  });
+  const calls: ChatToolCallItem[] = items.map((item) => ({
+    key: item.toolUseId,
+    // The name is what a person reads to tell one call from the next, and for
+    // Computer Use the display name is "Maka Computer" — a noun, identical on
+    // every row of a ten-call turn. A label derived from the call's own
+    // arguments says what happened instead.
+    name: computerActionLabel(item, locale) ?? resolveToolDisplayName(item, locale),
+    status: astryxToolStatus(item),
+    target: item.intent ? formatToolIntent(item.intent) : undefined,
+    duration: formatDuration(item.durationMs) ?? undefined,
+    errorMessage: toolCallErrorMessage(item, locale),
+    stats: outcomeWord(item, locale),
+    ...diffStats(itemDiffs(item)),
+    resultDetail: (
+      <ToolDetailReveal>
+        <ToolCallDetail item={item} onOpenLinkedSession={onOpenLinkedSession} />
+      </ToolDetailReveal>
+    ),
+  }));
 
   // No defaultIsExpanded: opening a group is the reader's move. Seeding it open
   // from in-flight status latches, since the prop is uncontrolled and the
   // timeline key is stable (see timelineEntryKey). Cost: the collapsed header
   // projects the last call, which can settle before a parallel sibling.
-  return <ChatToolCalls calls={calls} />;
+  //
+  // A group's own +/- is the whole turn's, not the last call's: a run of five
+  // Edits collapses to one line, and "what did this turn change" is the
+  // question that line has to answer. Per-call counts stay on the rows inside.
+  return <ChatToolCalls calls={calls} {...diffStats(items.flatMap(itemDiffs))} />;
 }
 
-/** Green `+N` / red `-N` on the row, from the shared structural parse; zero counts stay unpainted. */
-function diffRowStats(diff: string): { additions?: number; deletions?: number } {
-  const { additions, deletions } = countDiffLineStats(diff);
+/**
+ * Green `+N` / red `-N`, from the shared structural parse. One diff for a row,
+ * every diff in the run for the collapsed group header. Zero stays unpainted,
+ * so a run that changed no file leaves the header as it was rather than
+ * wearing a "0 changes" badge.
+ */
+function diffStats(diffs: string[]): { additions?: number; deletions?: number } {
+  let additions = 0;
+  let deletions = 0;
+  for (const diff of diffs) {
+    const stats = countDiffLineStats(diff);
+    additions += stats.additions;
+    deletions += stats.deletions;
+  }
   return {
     ...(additions > 0 ? { additions } : {}),
     ...(deletions > 0 ? { deletions } : {}),
   };
+}
+
+/** The diff a tool call produced, if it produced one. */
+function itemDiffs(item: ToolActivityItem): string[] {
+  return item.result?.kind === 'file_diff' ? [item.result.diff] : [];
 }
 
 function astryxToolStatus(item: ToolActivityItem): ChatToolCallItem['status'] {

@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { BackendStopMode } from '@maka/core/backend-types';
-import { VOICE_INPUT_MARKER, type EphemeralVoiceAudio } from '@maka/core/voice';
 import {
   agentRunMatchesHostedRootExecution,
   type AgentRunHeader,
@@ -71,6 +70,7 @@ import type { RuntimeHostResidency } from './host-kernel.js';
 import type { HostInteractionCoordinator } from './interaction-coordinator.js';
 import {
   type HostMessageRootState,
+  type HostMessagePreparationInput,
   type HostMessageSessionHeader,
   type HostMessageStartInput,
   type HostMessageStopClaim,
@@ -79,6 +79,7 @@ import {
   type QueueFenceResult,
   type RootFollowupBatch,
 } from './message-coordinator.js';
+import { messageContentDigest } from './message-content-digest.js';
 import type {
   ConnectionContext,
   ContextOperationHandlerMap,
@@ -136,7 +137,6 @@ interface RootMessageStartRequestBase {
   readonly prepareReplayContent?: (
     lease: SessionAdmissionLease,
   ) => Promise<RootMessageContentPreparation>;
-  readonly prepareVoiceAudio?: () => Promise<EphemeralVoiceAudio>;
 }
 
 type RootMessageStartRequest =
@@ -175,13 +175,12 @@ export interface HostedExternalTurnTransitionInput {
 }
 
 type RootTurnActivationInput =
-  | (TurnStartInput & { readonly voiceAudio?: EphemeralVoiceAudio })
+  | TurnStartInput
   | {
       sessionId: string;
       turnId: string;
       content: null;
       turnOrchestration?: undefined;
-      voiceAudio?: EphemeralVoiceAudio;
     };
 
 type TurnResumeStartOutcome = OperationOutcome<'turn.resume.start'>;
@@ -309,15 +308,6 @@ interface HostTurnAttachmentValidator {
   ): Promise<string | undefined>;
 }
 
-interface HostVoiceInputAuthority {
-  consumeNativeAudio(input: {
-    readonly operationId: string;
-    readonly connectionSlug: string;
-    readonly model: string;
-    readonly ownerConnectionId: string;
-  }): EphemeralVoiceAudio;
-}
-
 export class RootTurnCoordinator {
   readonly handlers: TurnOperationHandlerMap & ContextOperationHandlerMap = {
     'turn.start': (input, context) => this.startTurn(input, context),
@@ -353,7 +343,6 @@ export class RootTurnCoordinator {
     private readonly assertAutomationRecoveryAdmission?: (admission: RootTurnAdmission) => void,
     attachmentValidator?: HostTurnAttachmentValidator,
     prepareSkillInvocation?: HostSkillInvocationPreparer,
-    private readonly voice?: HostVoiceInputAuthority,
   ) {
     this.stores = authenticateExecutionStoresWriter(stores, 'interactive');
     this.attachmentValidator = attachmentValidator;
@@ -512,8 +501,7 @@ export class RootTurnCoordinator {
       }
       for (const admission of plan.pendingRecoveryClosures) {
         if (
-          (admission.execution.kind === 'external_message' &&
-            admission.execution.ephemeralInput !== 'voice') ||
+          admission.execution.kind === 'external_message' ||
           admission.execution.kind === 'regenerate' ||
           admission.execution.kind === 'context_compact' ||
           admission.execution.kind === 'automation' ||
@@ -1529,24 +1517,51 @@ export class RootTurnCoordinator {
         const header = await this.stores.sessionStore.readHeaderSnapshot(input.sessionId);
         const unavailableReason = runtimeHostExternalTurnUnavailableReason(header);
         if (unavailableReason) return { error: unavailableReason };
-        const binding = await this.clientCapabilities?.bindSession(
-          input.sessionId,
-          input.initiatingConnectionId,
-        );
+        const turnId = randomUUID();
+        const hasSkillInvocation = parseSkillInvocationTokens(content.text).length > 0;
+        const prepared = hasSkillInvocation
+          ? await this.prepareHostedSkillInvocationContent(
+              input.sessionId,
+              turnId,
+              content,
+              [],
+              input.initiatingConnectionId,
+            )
+          : ({ kind: 'ready', content } as const);
+        if (prepared.kind === 'rejected') {
+          return {
+            error: prepared.outcome.ok
+              ? 'Hosted Skill invocation was rejected'
+              : prepared.outcome.error.message,
+          };
+        }
+        const canonicalContent = preflightRootMessageContent(prepared.content);
+        if (!canonicalContent.ok)
+          return { error: 'Prepared message content exceeds durable limits' };
+        const binding = prepared.commitCapabilityBinding
+          ? await prepared.commitCapabilityBinding()
+          : await this.clientCapabilities?.bindSession(
+              input.sessionId,
+              input.initiatingConnectionId,
+            );
         if (binding && !binding.ok) return { error: binding.message };
         if (!this.beginRootAdmission(reservation)) {
           return { error: 'Root Turn reservation is no longer current' };
         }
 
-        const turnId = randomUUID();
         const admitted = await this.rootAdmissionOwner.admitRootTurn({
           sessionId: input.sessionId,
           turnId,
           proposedRunId: randomUUID(),
           proposedUserMessageId: input.sourceMessage.messageId,
-          execution: { kind: 'external_message' },
-          normalizedInput: content,
-          sourceMessages: [input.sourceMessage],
+          execution: {
+            kind: 'external_message',
+            inputDigest: messageContentDigest(content),
+          },
+          normalizedInput: canonicalContent.content,
+          sourceMessages: [
+            { ...input.sourceMessage, content: normalizeMessageContent(canonicalContent.content) },
+          ],
           admittedAt: Date.now(),
         });
         if (admitted.kind !== 'admitted') {
@@ -1555,7 +1570,7 @@ export class RootTurnCoordinator {
           );
         }
         const disposition = await this.prepareAdmittedTurn(
-          { sessionId: input.sessionId, turnId, content },
+          { sessionId: input.sessionId, turnId, content: canonicalContent.content },
           admitted.admission,
           this.acquireRecoveryResidency,
           admissionLease,
@@ -1572,6 +1587,29 @@ export class RootTurnCoordinator {
       } finally {
         this.releaseRootReservation(reservation);
       }
+    });
+  }
+
+  prepareMessage(
+    input: HostMessagePreparationInput,
+  ): Promise<
+    | { readonly kind: 'ready'; readonly content: MessageContent }
+    | { readonly kind: 'rejected'; readonly error: string }
+  > {
+    return this.runCommand(async () => {
+      const content = normalizeMessageContent(input.content);
+      if (parseSkillInvocationTokens(content.text).length === 0) {
+        return { kind: 'ready', content };
+      }
+      const prepare = () =>
+        this.prepareSkillInvocationContent(input.sessionId, input.turnId, content, []);
+      if (input.placement === 'current_turn') return prepare();
+      const preview = await this.previewCapabilityBinding(
+        input.sessionId,
+        input.initiatingConnectionId,
+        prepare,
+      );
+      return preview.ok ? preview.value : { kind: 'rejected', error: preview.message };
     });
   }
 
@@ -1617,20 +1655,14 @@ export class RootTurnCoordinator {
   }
 
   private startTurn(input: TurnStartInput, context: ConnectionContext): Promise<TurnStartOutcome> {
-    const voiceOperationId = input.voiceOperationId;
-    const normalizedContent = normalizeMessageContent(input.content);
-    const content =
-      voiceOperationId && normalizedContent.text.length === 0
-        ? normalizeMessageContent({ ...normalizedContent, text: VOICE_INPUT_MARKER })
-        : normalizedContent;
+    const content = normalizeMessageContent(input.content);
     const skillIds = input.skillIds ?? [];
     const hasSkillInvocation =
       skillIds.length > 0 || parseSkillInvocationTokens(content.text).length > 0;
-    if (hasSkillInvocation || voiceOperationId) {
+    if (hasSkillInvocation) {
       const execution = {
         kind: 'external_message' as const,
-        inputDigest: hostedExternalInputDigest(content, skillIds, voiceOperationId),
-        ...(voiceOperationId ? { ephemeralInput: 'voice' as const } : {}),
+        inputDigest: hostedExternalInputDigest(content, skillIds),
       };
       return this.startRootMessage(
         {
@@ -1639,34 +1671,14 @@ export class RootTurnCoordinator {
           execution,
           ...(input.turnOrchestration ? { turnOrchestration: { ...input.turnOrchestration } } : {}),
           archivedMessage: 'Cannot start a new Turn in an archived Session',
-          prepareFreshContent: async () => {
-            const prepared = hasSkillInvocation
-              ? await this.prepareHostedSkillInvocationContent(
-                  input.sessionId,
-                  input.turnId,
-                  content,
-                  skillIds,
-                  context.connectionId,
-                )
-              : ({ kind: 'ready', content } as const);
-            return prepared;
-          },
-          ...(voiceOperationId
-            ? {
-                prepareVoiceAudio: async () => {
-                  if (!this.voice) {
-                    throw new Error('Hosted Voice input authority is unavailable');
-                  }
-                  const header = await this.stores.sessionStore.readHeaderSnapshot(input.sessionId);
-                  return this.voice.consumeNativeAudio({
-                    operationId: voiceOperationId,
-                    connectionSlug: header.llmConnectionSlug,
-                    model: header.model,
-                    ownerConnectionId: context.connectionId,
-                  });
-                },
-              }
-            : {}),
+          prepareFreshContent: async () =>
+            this.prepareHostedSkillInvocationContent(
+              input.sessionId,
+              input.turnId,
+              content,
+              skillIds,
+              context.connectionId,
+            ),
         },
         context,
       );
@@ -1691,29 +1703,46 @@ export class RootTurnCoordinator {
     skillIds: readonly string[],
     connectionId: string,
   ): Promise<RootMessageContentPreparation> {
-    if (!this.prepareSkillInvocation) {
-      return {
-        kind: 'rejected',
-        outcome: operationUnavailable('Hosted Skill invocation authority is unavailable'),
-      };
-    }
     const preview = await this.previewCapabilityBinding(sessionId, connectionId, () =>
-      this.prepareSkillInvocation!({ sessionId, turnId, text: content.text, skillIds }),
+      this.prepareSkillInvocationContent(sessionId, turnId, content, skillIds),
     );
     if (!preview.ok) {
       return { kind: 'rejected', outcome: operationConflict(preview.message) };
     }
-    if (preview.value.disposition === 'blocked') {
+    if (preview.value.kind === 'rejected') {
       return {
         kind: 'rejected',
-        outcome: operationConflict('Explicit Skill invocation could not be resolved'),
+        outcome: operationConflict(preview.value.error),
       };
     }
     return {
       kind: 'ready',
-      content: composeHostedSkillInvocationContent(content, preview.value),
+      content: preview.value.content,
       commitCapabilityBinding: preview.commit,
     };
+  }
+
+  private async prepareSkillInvocationContent(
+    sessionId: string,
+    turnId: string,
+    content: MessageContent,
+    skillIds: readonly string[],
+  ): Promise<
+    | { readonly kind: 'ready'; readonly content: MessageContent }
+    | { readonly kind: 'rejected'; readonly error: string }
+  > {
+    if (!this.prepareSkillInvocation) {
+      return { kind: 'rejected', error: 'Hosted Skill invocation authority is unavailable' };
+    }
+    const prepared = await this.prepareSkillInvocation({
+      sessionId,
+      turnId,
+      text: content.text,
+      skillIds,
+    });
+    return prepared.disposition === 'blocked'
+      ? { kind: 'rejected', error: 'Explicit Skill invocation could not be resolved' }
+      : { kind: 'ready', content: composeHostedSkillInvocationContent(content, prepared) };
   }
 
   private regenerateTurn(
@@ -1792,19 +1821,8 @@ export class RootTurnCoordinator {
               return completedStart({ ok: true, result: snapshot });
             }
           }
-          let voiceAudio: EphemeralVoiceAudio | undefined;
-          if (request.prepareVoiceAudio) {
-            try {
-              voiceAudio = await request.prepareVoiceAudio();
-            } catch {
-              return completedStart(operationConflict('Voice input operation is not available'));
-            }
-          }
           return this.prepareAdmittedTurn(
-            {
-              ...activationInputForAdmission(existing),
-              ...(voiceAudio ? { voiceAudio } : {}),
-            },
+            activationInputForAdmission(existing),
             existing,
             context.acquireResidency,
             lease,
@@ -1867,14 +1885,6 @@ export class RootTurnCoordinator {
         if (binding && !binding.ok) {
           return completedStart(operationConflict(binding.message));
         }
-        let voiceAudio: EphemeralVoiceAudio | undefined;
-        if (request.prepareVoiceAudio) {
-          try {
-            voiceAudio = await request.prepareVoiceAudio();
-          } catch {
-            return completedStart(operationConflict('Voice input operation is not available'));
-          }
-        }
         if (!this.beginRootAdmission(reservation)) {
           return completedStart(sessionBusy('Root Turn reservation is no longer current'));
         }
@@ -1900,10 +1910,7 @@ export class RootTurnCoordinator {
           );
         }
         return this.prepareAdmittedTurn(
-          {
-            ...activationInputForAdmission(admitted.admission),
-            ...(voiceAudio ? { voiceAudio } : {}),
-          },
+          activationInputForAdmission(admitted.admission),
           admitted.admission,
           context.acquireResidency,
           lease,
@@ -2455,13 +2462,6 @@ export class RootTurnCoordinator {
         'Root Turn admission payload does not match its input',
       );
     }
-    if (
-      admission.execution.kind === 'external_message' &&
-      admission.execution.ephemeralInput === 'voice' &&
-      !input.voiceAudio
-    ) {
-      return completedStart(operationConflict('Voice input payload is no longer available'));
-    }
     const session = await this.stores.sessionStore.readHeaderSnapshot(input.sessionId);
     const unavailableReason =
       admission.execution.kind === 'safe_boundary_continuation'
@@ -2574,7 +2574,7 @@ export class RootTurnCoordinator {
       }
     }
     this.#activeBySession.set(input.sessionId, entry);
-    entry.done = this.drainTurn(input, entry, startSettled, input.voiceAudio);
+    entry.done = this.drainTurn(input, entry, startSettled);
     void entry.done.catch(() => undefined);
     if (rootReservation) {
       this.#reservationsBySession.delete(input.sessionId);
@@ -2616,7 +2616,6 @@ export class RootTurnCoordinator {
     input: RootTurnActivationInput,
     active: ActiveRootTurn,
     startSettled: Deferred,
-    voiceAudio?: EphemeralVoiceAudio,
   ): Promise<void> {
     let terminalTransitionStarted = false;
     try {
@@ -2653,7 +2652,6 @@ export class RootTurnCoordinator {
                   {
                     turnId: input.turnId,
                     ...normalizeMessageContent(requireRootMessageContent(input)),
-                    ...(voiceAudio ? { voiceAudio } : {}),
                     ...(active.descriptor.kind === 'regenerate'
                       ? {
                           parentTurnId: active.descriptor.sourceTurnId,
@@ -2855,7 +2853,10 @@ export class RootTurnCoordinator {
       turnId,
       proposedRunId: randomUUID(),
       proposedUserMessageId: randomUUID(),
-      execution: { kind: 'external_message' },
+      execution: {
+        kind: 'external_message',
+        inputDigest: messageContentDigest(batch.submittedContent),
+      },
       normalizedInput: batch.content,
       sourceMessages: batch.sources,
       admittedAt: Date.now(),
@@ -3096,10 +3097,9 @@ function rootMessageAdmissionMatches(
 function hostedExternalInputDigest(
   content: MessageContent,
   skillIds: readonly string[],
-  voiceOperationId?: string,
 ): `sha256:${string}` {
   return `sha256:${createHash('sha256')
-    .update(JSON.stringify({ content, skillIds: [...skillIds], voiceOperationId }))
+    .update(JSON.stringify({ content, skillIds: [...skillIds] }))
     .digest('hex')}`;
 }
 
@@ -3254,8 +3254,7 @@ function recoveryExecutionContract(
       return {
         allowsQueueSources: true,
         requiresUserMessage: true,
-        pendingWithoutRun:
-          execution.ephemeralInput === 'voice' ? 'host_recovery_closure' : 'root_replay',
+        pendingWithoutRun: 'root_replay',
       };
     case 'regenerate':
       return {

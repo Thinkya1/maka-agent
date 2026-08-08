@@ -8,7 +8,7 @@ import type {
   ModelDiscoveryResult,
   ProviderType,
 } from '@maka/core';
-import { ProvidersPanel, type ConnectionsBridge } from '../../src/renderer/settings/ProvidersPanel';
+import { ProvidersPanel, type ConnectionsBridge } from '../../src/renderer/settings/providers-panel';
 import { SettingsPage } from '../../src/renderer/settings/settings-section';
 
 const NOW = Date.parse('2026-07-01T08:00:00Z');
@@ -160,6 +160,12 @@ function createBridge(input: {
       const updated: LlmConnection = {
         ...current,
         ...patch,
+        // UpdateConnectionInput.relayModelProfiles is tri-state (null clears);
+        // a stored connection never carries null — clear maps to absent.
+        relayModelProfiles:
+          patch.relayModelProfiles === undefined
+            ? current.relayModelProfiles
+            : (patch.relayModelProfiles ?? undefined),
         updatedAt: NOW,
       };
       connections = connections.map((connection) => connection.slug === slug ? updated : connection);

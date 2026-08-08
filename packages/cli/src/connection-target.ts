@@ -1,6 +1,7 @@
 import { isConnectionReady, type ChatConfigurationReason } from '@maka/core/connection-readiness';
 import type { LlmConnection, ProviderType } from '@maka/core/llm-connections';
 import { connectionEnabledModelIds, PROVIDER_DEFAULTS } from '@maka/core/llm-connections';
+import { thinkingVariantsForConnection } from '@maka/core/model-thinking';
 import {
   isOAuthSubscriptionProvider,
   resolveOAuthSubscriptionTokens,
@@ -8,23 +9,13 @@ import {
   type OAuthSubscriptionTokens,
 } from '@maka/runtime';
 import type { ConnectionStore, CredentialKind, CredentialStore } from '@maka/storage';
+import type { ModelChoice } from './pi-tui-contracts.js';
 
 export interface ReadySessionTarget {
   connection: LlmConnection;
   apiKey: string;
   model: string;
   oauthTokens?: OAuthSubscriptionTokens;
-}
-
-/** One selectable model in the `/model` picker, tagged with its owning connection. */
-export interface ModelChoice {
-  connectionSlug: string;
-  connectionName: string;
-  providerType: ProviderType;
-  model: string;
-  isDefaultConnection: boolean;
-  /** Maximum context tokens for this model, resolved from the connection or provider catalog. */
-  contextWindow?: number;
 }
 
 export function selectableModelIdsForTarget(
@@ -154,6 +145,7 @@ export async function listReadyModelChoices(input: {
           model,
           isDefaultConnection: connection.slug === defaultSlug,
           contextWindow: resolveSelectedModelContextWindow(connection, model),
+          thinkingLevels: thinkingVariantsForConnection(connection, model),
         });
       }
     } catch {

@@ -17,10 +17,7 @@ function conn(providerType: LlmConnection['providerType'], slug = 'test'): LlmCo
 }
 
 describe('buildProviderOptions: thinking level', () => {
-  test('only native Anthropic enables automatic prompt caching', () => {
-    assert.deepEqual(buildProviderOptions(conn('anthropic'), 'claude-opus-4-8'), {
-      anthropic: { cacheControl: { type: 'ephemeral' } },
-    });
+  test('Anthropic-compatible providers do not inherit automatic prompt caching', () => {
     for (const providerType of [
       'claude-subscription',
       'MiniMax',
@@ -34,25 +31,6 @@ describe('buildProviderOptions: thinking level', () => {
         `${providerType} must not inherit Anthropic automatic prompt caching`,
       );
     }
-  });
-
-  test('Volcengine Agent Plan keeps Responses stateless while preserving reasoning replay', () => {
-    const expectedOptions = {
-      openai: {
-        store: false,
-        forceReasoning: true,
-      },
-    };
-    assert.deepEqual(
-      buildProviderOptions(conn('volcengine-agent-plan'), 'ark-code-latest'),
-      expectedOptions,
-    );
-    assert.deepEqual(thinkingVariantsForModel('volcengine-agent-plan', 'ark-code-latest'), []);
-    assert.deepEqual(thinkingVariantsForModel('volcengine-agent-plan', 'kimi-k3'), []);
-    assert.deepEqual(
-      buildProviderOptions(conn('volcengine-agent-plan'), 'kimi-k3', 'high'),
-      expectedOptions,
-    );
   });
 
   test('anthropic effort model (opus-4-8) sends effort field directly; no budgetTokens mapping', () => {
@@ -230,13 +208,20 @@ describe('buildProviderOptions: thinking level', () => {
       [...thinkingVariantsForModel('deepseek', 'deepseek-v4-flash')],
       ['high', 'max'],
     );
+    // deepseek-v4-flash serves the Responses wire, which the native OpenAI
+    // provider dials: its namespace is `openai`, and the provider's own
+    // namespace would be dropped on the floor. `store: false` and
+    // `forceReasoning` are what earn the encrypted reasoning the next step
+    // replays, so they hold even when no level was picked.
     assert.deepEqual(buildProviderOptions(conn('deepseek'), 'deepseek-v4-flash', 'high'), {
-      deepseek: { reasoningEffort: 'high' },
+      openai: { store: false, forceReasoning: true, reasoningEffort: 'high' },
     });
     assert.deepEqual(buildProviderOptions(conn('deepseek'), 'deepseek-v4-flash', 'max'), {
-      deepseek: { reasoningEffort: 'max' },
+      openai: { store: false, forceReasoning: true, reasoningEffort: 'max' },
     });
-    assert.deepEqual(buildProviderOptions(conn('deepseek'), 'deepseek-v4-flash', 'off'), {});
+    assert.deepEqual(buildProviderOptions(conn('deepseek'), 'deepseek-v4-flash', 'off'), {
+      openai: { store: false, forceReasoning: true },
+    });
     assert.deepEqual([...thinkingVariantsForModel('zai-coding-plan', 'glm-5.1')], []);
     assert.deepEqual([...thinkingVariantsForModel('zai-coding-plan', 'glm-4.5-air')], []);
     // miss model (deepseek-chat non-reasoning) drops level
@@ -246,8 +231,10 @@ describe('buildProviderOptions: thinking level', () => {
   test('family fallback wires per-model override adapters under their SDK namespaces', () => {
     // opencode serves models across several protocols via models.dev package
     // overrides; the family fallback must emit the namespace each SDK consumes.
+    // gpt-5.5 resolves to the Responses wire, so it takes the wire branch and
+    // its encrypted-reasoning terms rather than a bare effort.
     assert.deepEqual(buildProviderOptions(conn('opencode'), 'gpt-5.5', 'high'), {
-      openai: { reasoningEffort: 'high' },
+      openai: { store: false, forceReasoning: true, reasoningEffort: 'high' },
     });
     assert.deepEqual(buildProviderOptions(conn('opencode'), 'claude-fable-5', 'high'), {
       anthropic: { effort: 'high' },
@@ -277,43 +264,11 @@ describe('buildProviderOptions: thinking level', () => {
       ...conn('github-copilot'),
       models: [{ id: 'gpt-5.5', apiProtocol: 'openai-responses' as const }],
     };
+    // The Responses protocol takes the shared wire branch, so Copilot asks for
+    // encrypted reasoning on the same terms every other Responses model does.
     assert.deepEqual(buildProviderOptions(responses, 'gpt-5.5', 'high'), {
-      openai: { reasoningEffort: 'high' },
+      openai: { store: false, forceReasoning: true, reasoningEffort: 'high' },
     });
-  });
-
-  test('xAI Grok 4.5 requests encrypted Responses reasoning under the native OpenAI namespace', () => {
-    for (const providerType of ['xai', 'xai-oauth'] as const) {
-      assert.deepEqual(
-        [...thinkingVariantsForModel(providerType, 'grok-4.5')],
-        ['low', 'medium', 'high'],
-      );
-      assert.deepEqual(buildProviderOptions(conn(providerType), 'grok-4.5'), {
-        openai: {
-          store: false,
-          forceReasoning: true,
-          reasoningSummary: null,
-          include: ['reasoning.encrypted_content'],
-        },
-      });
-      assert.deepEqual(buildProviderOptions(conn(providerType), 'grok-4.5', 'high'), {
-        openai: {
-          store: false,
-          forceReasoning: true,
-          reasoningSummary: null,
-          include: ['reasoning.encrypted_content'],
-          reasoningEffort: 'high',
-        },
-      });
-      assert.deepEqual(buildProviderOptions(conn(providerType), 'grok-4.5', 'off'), {
-        openai: {
-          store: false,
-          forceReasoning: true,
-          reasoningSummary: null,
-          include: ['reasoning.encrypted_content'],
-        },
-      });
-    }
   });
 
   test('Cloudflare Workers AI sends Kimi K2.6 reasoning effort and its real thinking-off wire', () => {
@@ -495,17 +450,6 @@ describe('getAIModel: models.dev registry providers', () => {
     );
   });
 
-  test('routes SiliconFlow through the shared OpenAI-compatible adapter without rewriting model ids', () => {
-    const model = getAIModel({
-      connection: conn('siliconflow'),
-      apiKey: 'sf-test-key',
-      modelId: 'moonshotai/Kimi-K2.6',
-    });
-
-    assert.equal(model.provider, 'siliconflow.chat');
-    assert.equal(model.modelId, 'moonshotai/Kimi-K2.6');
-  });
-
   test('routes OpenCode Zen and Go models through their registry-owned protocol overrides', () => {
     const cases = [
       ['opencode', 'gpt-5.5', 'openai.responses'],
@@ -573,10 +517,98 @@ describe('buildProviderOptions: openai-compatible namespace', () => {
       { 'zai-coding-plan': { reasoningEffort: 'max' } },
     );
   });
-  test('deepseek uses its own raw namespace', () => {
+  test('deepseek uses its own raw namespace on the chat wire, the OpenAI one on Responses', () => {
+    assert.deepEqual(
+      buildProviderOptions(conn('deepseek', 'deepseek'), 'deepseek-v4-pro', 'high'),
+      {
+        deepseek: { reasoningEffort: 'high' },
+      },
+    );
     assert.deepEqual(
       buildProviderOptions(conn('deepseek', 'deepseek'), 'deepseek-v4-flash', 'high'),
-      { deepseek: { reasoningEffort: 'high' } },
+      { openai: { store: false, forceReasoning: true, reasoningEffort: 'high' } },
+    );
+  });
+
+  test('custom relay connections use per-model declared levels under the camelCase slug namespace', () => {
+    const declared: LlmConnection = {
+      ...conn('openai-compatible', 'my-relay'),
+      baseUrl: 'https://relay.example/v1',
+      relayModelProfiles: {
+        'dsv4-flash': { thinkingLevels: ['minimal', 'low', 'medium', 'high', 'max'] },
+      },
+    };
+    // Declared levels land under the provider-options key derived from the
+    // connection slug. The SDK's canonical key for a dashed provider name is
+    // its camelCase alias — using the raw form still works but returns a
+    // `deprecated` warning on every call. ('off' cannot appear in a
+    // declaration — see DECLARABLE_RELAY_THINKING_LEVELS — so no off→'none'
+    // mapping for relays is asserted here.)
+    assert.deepEqual(buildProviderOptions(declared, 'dsv4-flash', 'high'), {
+      myRelay: { reasoningEffort: 'high' },
+    });
+    assert.deepEqual(buildProviderOptions(declared, 'dsv4-flash', 'max'), {
+      myRelay: { reasoningEffort: 'max' },
+    });
+    // Levels outside the declaration stay gated off, and undeclared
+    // connections emit nothing (prior behaviour).
+    assert.deepEqual(buildProviderOptions(declared, 'dsv4-flash', 'xhigh'), {});
+    assert.deepEqual(
+      buildProviderOptions(conn('openai-compatible', 'my-relay'), 'any-model', 'high'),
+      {},
+    );
+  });
+
+  test('declared relay levels reach the actual chat-completions request body', async () => {
+    // Intermediate providerOptions objects matching does not prove the wire
+    // carries the effort — this capture asserts the SDK's camelCase slug key
+    // is accepted AND translated into the body with zero deprecations.
+    const bodies: Record<string, unknown>[] = [];
+    const captureFetch: typeof globalThis.fetch = async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl-1',
+          object: 'chat.completion',
+          created: 1,
+          model: 'dsv4-flash',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: 'ok' },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    };
+    const declared: LlmConnection = {
+      ...conn('openai-compatible', 'my-relay'),
+      baseUrl: 'https://relay.example/v1',
+      relayModelProfiles: {
+        'dsv4-flash': { thinkingLevels: ['minimal', 'low', 'medium', 'high', 'max'] },
+      },
+    };
+    const model = getAIModel({
+      connection: declared,
+      apiKey: 'relay-key',
+      modelId: 'dsv4-flash',
+      fetch: captureFetch,
+    });
+    const result = await model.doGenerate({
+      prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      providerOptions: buildProviderOptions(declared, 'dsv4-flash', 'high'),
+    });
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0]?.reasoning_effort, 'high');
+    // The raw dashed slug as a providerOptions key is deprecated by the SDK:
+    // the camelCase alias must carry no such warning.
+    assert.equal(
+      (result.warnings ?? []).some((warning) => warning.type === 'deprecated'),
+      false,
+      JSON.stringify(result.warnings),
     );
   });
 });

@@ -174,6 +174,32 @@ export function normalizeMessageContent(content: MessageContent): MessageContent
   };
 }
 
+export function aggregateMessageContents(contents: readonly MessageContent[]): MessageContent {
+  const text = contents.map((content) => content.text).join('\n\n');
+  const displayText = contents.map((content) => content.displayText ?? content.text).join('\n\n');
+  const attachments = contents.flatMap((content) => content.attachments ?? []);
+  const quotes = contents.flatMap((content) => content.quotes ?? []);
+  const inlineReferences: InlineReference[] = [];
+  const hasInlineReferenceMarker = contents.some(
+    (content) => content.inlineReferences !== undefined,
+  );
+  let displayOffset = 0;
+  for (const content of contents) {
+    for (const reference of content.inlineReferences ?? []) {
+      if (inlineReferences.length === INLINE_REFERENCE_MAX_COUNT) break;
+      inlineReferences.push({ ...reference, start: displayOffset + reference.start });
+    }
+    displayOffset += (content.displayText ?? content.text).length + 2;
+  }
+  return normalizeMessageContent({
+    text,
+    ...(displayText !== text ? { displayText } : {}),
+    ...(attachments.length > 0 ? { attachments } : {}),
+    ...(quotes.length > 0 ? { quotes } : {}),
+    ...(hasInlineReferenceMarker ? { inlineReferences } : {}),
+  });
+}
+
 export function decodeMessageContent(value: unknown): MessageContent {
   if (!isMessageContent(value)) throw new TypeError('Invalid MessageContent');
   return normalizeMessageContent(value);
@@ -449,6 +475,8 @@ export type SessionEvent =
 export interface TextDeltaEvent extends BaseEvent {
   type: 'text_delta';
   messageId: string;
+  /** Absolute UTF-16 offset for replay-safe streams; absent for append-only backends. */
+  startOffset?: number;
   text: string;
 }
 
@@ -463,6 +491,8 @@ export interface TextCompleteEvent extends BaseEvent {
 export interface ThinkingDeltaEvent extends BaseEvent {
   type: 'thinking_delta';
   messageId: string;
+  /** Absolute UTF-16 offset for replay-safe streams; absent for append-only backends. */
+  startOffset?: number;
   text: string;
 }
 
@@ -949,6 +979,7 @@ export interface SteeringMessageEvent extends BaseEvent {
   type: 'steering_message';
   messageId: string;
   content: MessageContent;
+  submittedContentDigest?: `sha256:${string}`;
 }
 
 /**

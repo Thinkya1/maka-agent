@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { after, describe, test } from 'node:test';
 import type { LlmConnection } from '@maka/core';
+import { PROVIDER_DEFAULTS } from '@maka/core/llm-connections';
 import {
   fetchProviderModels,
   ProviderModelDiscoveryHttpError,
@@ -123,6 +124,7 @@ describe('fetchProviderModels', () => {
   test('Fireworks bounds account concurrency while preserving normal pagination', async () => {
     let activeModelRequests = 0;
     let maxActiveModelRequests = 0;
+    const initialModelResponses: Array<() => void> = [];
     const server = await startJsonServer((request, response) => {
       const url = new URL(request.url ?? '', 'http://test.local');
       if (url.pathname === '/v1/accounts') {
@@ -136,7 +138,7 @@ describe('fetchProviderModels', () => {
 
       activeModelRequests += 1;
       maxActiveModelRequests = Math.max(maxActiveModelRequests, activeModelRequests);
-      setTimeout(() => {
+      const respondWithModels = () => {
         activeModelRequests -= 1;
         const account = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/models$/)?.[1] ?? 'unknown';
         const pageToken = url.searchParams.get('pageToken');
@@ -144,7 +146,15 @@ describe('fetchProviderModels', () => {
           models: [{ name: `accounts/${account}/models/${pageToken ?? 'first'}` }],
           ...(account === 'team-0' && !pageToken ? { nextPageToken: 'second' } : {}),
         });
-      }, 10);
+      };
+      if (initialModelResponses.length < 4) {
+        initialModelResponses.push(respondWithModels);
+        if (initialModelResponses.length === 4) {
+          for (const respond of initialModelResponses) respond();
+        }
+        return;
+      }
+      respondWithModels();
     });
 
     const models = await fetchProviderModels(fireworksConnection(server.url), 'fireworks-key');
@@ -303,20 +313,13 @@ describe('fetchProviderModels', () => {
     );
   });
 
-  test('Claude subscription model fetch uses OAuth bearer headers, not x-api-key', async () => {
-    let observedAuth = '';
-    let observedApiKey = '';
-    let observedBeta = '';
-    let observedApp = '';
-    const server = await startJsonServer((request, response) => {
-      observedAuth = request.headers.authorization ?? '';
-      observedApiKey = (request.headers['x-api-key'] as string | undefined) ?? '';
-      observedBeta = (request.headers['anthropic-beta'] as string | undefined) ?? '';
-      observedApp = (request.headers['x-app'] as string | undefined) ?? '';
-      assert.equal(request.url, '/v1/models');
-      respondJson(response, 200, {
-        data: [{ id: 'claude-sonnet-4-5-20250929' }],
-      });
+  test('Claude subscription model fetch serves the curated list without calling /v1/models', async () => {
+    // The subscription OAuth token is session-scoped (no user:inference), so
+    // GET /v1/models would 401. Discovery must stay off the network entirely.
+    let requests = 0;
+    const server = await startJsonServer((_request, response) => {
+      requests += 1;
+      respondJson(response, 401, { error: 'insufficient scope' });
     });
 
     const models = await fetchProviderModels(
@@ -333,36 +336,39 @@ describe('fetchProviderModels', () => {
       'oauth-access-token',
     );
 
-    assert.equal(observedAuth, 'Bearer oauth-access-token');
-    assert.equal(observedApiKey, '');
-    assert.match(observedBeta, /oauth-2025-04-20/);
-    assert.equal(observedApp, 'cli');
-    assert.deepEqual(models, [{ id: 'claude-sonnet-4-5-20250929' }]);
+    assert.equal(requests, 0);
+    assert.deepEqual(
+      models,
+      PROVIDER_DEFAULTS['claude-subscription'].fallbackModels.map((id) => ({ id })),
+    );
   });
 
-  test('Claude subscription model fetch accepts a stored /v1 base URL without doubling it', async () => {
+  test('Anthropic model fetch accepts a stored /v1 base URL without doubling it', async () => {
     let observedPath = '';
+    let observedApiKey = '';
     const server = await startJsonServer((request, response) => {
       observedPath = request.url ?? '';
-      respondJson(response, 200, { data: [{ id: 'claude-haiku-4-5-20251001' }] });
+      observedApiKey = (request.headers['x-api-key'] as string | undefined) ?? '';
+      respondJson(response, 200, { data: [{ id: 'claude-sonnet-4-5-20250929' }] });
     });
 
     const models = await fetchProviderModels(
       {
-        slug: 'claude-subscription',
-        name: 'Claude OAuth',
-        providerType: 'claude-subscription',
+        slug: 'anthropic-main',
+        name: 'Anthropic',
+        providerType: 'anthropic',
         baseUrl: `${server.url}/v1`,
-        defaultModel: 'claude-haiku-4-5-20251001',
+        defaultModel: 'claude-sonnet-4-5-20250929',
         enabled: true,
         createdAt: 1,
         updatedAt: 1,
       },
-      'oauth-access-token',
+      'anthropic-api-key',
     );
 
     assert.equal(observedPath, '/v1/models');
-    assert.deepEqual(models, [{ id: 'claude-haiku-4-5-20251001' }]);
+    assert.equal(observedApiKey, 'anthropic-api-key');
+    assert.deepEqual(models, [{ id: 'claude-sonnet-4-5-20250929' }]);
   });
 
   test('Codex OAuth discovers models from the chatgpt.com/backend-api/codex/models endpoint', async () => {

@@ -24,6 +24,8 @@ import {
   isTerminalRuntimeEvent,
   isTerminalRuntimeEventStatus,
   isPartialRuntimeEvent,
+  runtimeEventEnvelopeKeys,
+  runtimeEventEnvelopeValueDomains,
   runtimeEventHasModelVisibleContent,
   type RuntimeEvent,
   type RuntimeEventActions,
@@ -62,6 +64,44 @@ const runtimeEventValidationCorpus = JSON.parse(
     'utf8',
   ),
 ) as RuntimeEventValidationCorpus;
+
+test('the shared validation corpus exercises every envelope key', () => {
+  // The corpus is what the Python exporter in `packages/headless/harbor`
+  // validates against, and it is the only thing tying that re-implementation to
+  // this one. A key no case ever sets is a key the exporter can silently not
+  // know about — which is exactly how `origin` and `modelVisibility` came to
+  // fail every event of an 89-cell benchmark run.
+  // Only cases the corpus expects to be accepted count. A rejected case carries
+  // a value both sides refuse, so it passes just as well against an exporter
+  // that never learned the key at all — which is the one thing this is here to
+  // catch.
+  const exercised = new Set([
+    ...Object.keys(runtimeEventValidationCorpus.baseEvent),
+    ...runtimeEventValidationCorpus.cases
+      .filter((entry) => entry.accepted)
+      .flatMap((entry) => Object.keys(entry.overrides)),
+  ]);
+  for (const key of runtimeEventEnvelopeKeys()) {
+    assert.ok(exercised.has(key), `no corpus case sets the envelope key ${key}`);
+  }
+});
+
+test('the shared validation corpus exercises every envelope value domain', () => {
+  // The same drift one level down. Python spells these domains out again, so a
+  // member no accepted case carries is a member the exporter may reject while
+  // this side accepts it — and every event that carries it degrades to a
+  // one-line summary, exactly as an unknown key did.
+  const accepted = runtimeEventValidationCorpus.cases.filter((entry) => entry.accepted);
+  for (const [key, domain] of Object.entries(runtimeEventEnvelopeValueDomains())) {
+    const carried = new Set([
+      runtimeEventValidationCorpus.baseEvent[key],
+      ...accepted.map((entry) => entry.overrides[key]),
+    ]);
+    for (const member of domain) {
+      assert.ok(carried.has(member), `no corpus case carries ${key}: ${member}`);
+    }
+  }
+});
 
 test('Core decoder matches the shared RuntimeEvent validation corpus', () => {
   for (const entry of runtimeEventValidationCorpus.cases) {
@@ -831,6 +871,18 @@ describe('createRuntimeEventId', () => {
 });
 
 describe('RuntimeEvent shape compile-time contract', () => {
+  test('accepts only canonical source message digests', () => {
+    const digest = `sha256:${'a'.repeat(64)}` as `sha256:${string}`;
+    const event = baseEvent({ refs: { sourceMessageDigest: digest } });
+    expect(decodeRuntimeEvent(event).refs?.sourceMessageDigest).toBe(digest);
+    assert.throws(() =>
+      decodeRuntimeEvent({
+        ...event,
+        refs: { sourceMessageDigest: 'sha256:not-a-digest' },
+      }),
+    );
+  });
+
   test('accepts a provider-request trace reference and rejects a non-string reference', () => {
     const event = baseEvent({ refs: { providerRequestTraceId: 'provider-trace-1' } });
     expect(decodeRuntimeEvent(event).refs?.providerRequestTraceId).toBe('provider-trace-1');

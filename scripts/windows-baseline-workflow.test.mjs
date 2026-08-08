@@ -1,8 +1,55 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 const workflowUrl = new URL('../.github/workflows/windows-baseline.yml', import.meta.url);
+const processIdentityScriptUrl = new URL('./windows-process-identity.ps1', import.meta.url);
+
+function powerShellArgs(command) {
+  return ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command];
+}
+
+function resolvePowerShellExecutable(spawn = spawnSync) {
+  const failures = [];
+  for (const executable of ['pwsh.exe', 'powershell.exe']) {
+    const probe = spawn(executable, powerShellArgs('exit 0'), {
+      encoding: 'utf8',
+    });
+    if (probe.status === 0) return executable;
+    failures.push(
+      `${executable}: ${probe.error?.message || probe.stderr || probe.stdout || `exit ${probe.status}`}`,
+    );
+  }
+  assert.fail(`No usable PowerShell executable (${failures.join('; ')})`);
+}
+
+test('PowerShell resolution covers the documented Windows PowerShell fallback', () => {
+  for (const pwshFailure of [
+    {
+      status: null,
+      error: Object.assign(new Error('spawnSync pwsh.exe ENOENT'), { code: 'ENOENT' }),
+    },
+    { status: 1, error: undefined },
+  ]) {
+    const calls = [];
+    const executable = resolvePowerShellExecutable((command, args, options) => {
+      calls.push({ command, args, options });
+      return command === 'pwsh.exe'
+        ? { ...pwshFailure, stdout: '', stderr: '' }
+        : { status: 0, error: undefined, stdout: '', stderr: '' };
+    });
+
+    assert.equal(executable, 'powershell.exe');
+    assert.deepEqual(
+      calls.map(({ command }) => command),
+      ['pwsh.exe', 'powershell.exe'],
+    );
+    assert.deepEqual(calls[0].args, powerShellArgs('exit 0'));
+    assert.equal(calls[0].options.encoding, 'utf8');
+  }
+});
 
 test('Windows baseline workflow keeps its non-blocking evidence contract', async () => {
   const workflow = await readFile(workflowUrl, 'utf8');
@@ -40,6 +87,8 @@ test('Windows baseline workflow keeps its non-blocking evidence contract', async
   assert.match(workflow, /name: Capture process baseline/u);
   assert.match(workflow, /process-baseline\.json/u);
   assert.match(workflow, /CreationDate/u);
+  assert.match(workflow, /\. \.\/scripts\/windows-process-identity\.ps1/u);
+  assert.equal(workflow.match(/Get-WindowsProcessIdentityKey/gmu)?.length, 4);
   assert.match(workflow, /HashSet\[string\]/u);
   assert.match(workflow, /HashSet\[int\]/u);
   assert.doesNotMatch(workflow, /CommandLine -match/u);
@@ -61,4 +110,29 @@ test('Windows baseline workflow keeps its non-blocking evidence contract', async
   assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40} # v\d+\.\d+\.\d+/u);
   assert.match(workflow, /name: windows-baseline/u);
   assert.match(workflow, /retention-days: 14/u);
+});
+
+test('Windows process identity matches a non-empty JSON baseline to a live process object', {
+  skip: process.platform !== 'win32',
+}, () => {
+  const fixture = String.raw`
+      . '${fileURLToPath(processIdentityScriptUrl).replaceAll("'", "''")}'
+      $captured = [pscustomobject]@{
+        Processes = @([pscustomobject]@{
+          ProcessId = 4242
+          CreationDate = [DateTimeOffset]::Parse('2026-08-05T08:09:10.1234567+08:00').ToUniversalTime().ToString('o')
+        })
+      } | ConvertTo-Json -Depth 3 | ConvertFrom-Json
+      $live = [pscustomobject]@{
+        ProcessId = 4242
+        CreationDate = [DateTime]::Parse('2026-08-05T00:09:10.1234567Z').ToUniversalTime()
+      }
+      if ((Get-WindowsProcessIdentityKey $captured.Processes) -ne (Get-WindowsProcessIdentityKey $live)) {
+        exit 1
+      }
+    `;
+  const result = spawnSync(resolvePowerShellExecutable(), powerShellArgs(fixture), {
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.error?.message || result.stderr || result.stdout);
 });

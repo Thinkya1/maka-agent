@@ -7,14 +7,17 @@ type ShellControlsCopy = {
   navigation: {
     mainLabel: string;
     newTask: string;
+    /**
+     * Accessible name of the session-group header's new-task trigger
+     * (session-history-list.tsx). Deliberately NOT `newTask`: that copy is
+     * the rail's top-level SideNavItem's name, and two controls sharing one
+     * accessible name collide for `getByRole('button', { name })` and screen
+     * readers alike. The two entries share the handler, not the name.
+     */
+    groupNewTask: string;
     automations: string;
     extensions: string;
     settings: string;
-    update: string;
-    retryUpdate: string;
-    restartUpdate: string;
-    downloadingUpdate(percent: number): string;
-    updateAvailable(version: string): string;
     updateDownloaded(version: string): string;
     updateFailed(version: string): string;
     pendingReminders(count: number): string;
@@ -45,14 +48,10 @@ const SHELL_CONTROLS_COPY_BY_LOCALE = {
     navigation: {
       mainLabel: '主导航',
       newTask: '新任务',
+      groupNewTask: '新建任务',
       automations: '定时任务',
       extensions: '扩展',
       settings: '设置',
-      update: '更新',
-      retryUpdate: '重试更新',
-      restartUpdate: '重启',
-      downloadingUpdate: (percent: number) => `正在下载更新，${percent}%；点击可重新下载`,
-      updateAvailable: (version: string) => `发现新版本 ${version}`,
       updateDownloaded: (version: string) => `新版本 ${version} 已下载，重启后安装`,
       updateFailed: (version: string) => `新版本 ${version} 更新失败，点击重试或手动下载`,
       pendingReminders: (count: number) => `定时任务，${count} 个未完成提醒`,
@@ -81,14 +80,10 @@ const SHELL_CONTROLS_COPY_BY_LOCALE = {
     navigation: {
       mainLabel: 'Main navigation',
       newTask: 'New task',
+      groupNewTask: 'New task in group',
       automations: 'Scheduled tasks',
       extensions: 'Extensions',
       settings: 'Settings',
-      update: 'Update',
-      retryUpdate: 'Retry update',
-      restartUpdate: 'Restart',
-      downloadingUpdate: (percent: number) => `Downloading update, ${percent}%. Click to retry.`,
-      updateAvailable: (version: string) => `Update available: ${version}`,
       updateDownloaded: (version: string) => `Update ${version} downloaded. Restart to install.`,
       updateFailed: (version: string) => `Update ${version} failed. Click to retry or download manually.`,
       pendingReminders: (count: number) => `Scheduled tasks, ${count} unfinished ${count === 1 ? 'reminder' : 'reminders'}`,

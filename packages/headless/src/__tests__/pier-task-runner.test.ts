@@ -18,6 +18,7 @@ import { competitorRepoFiles } from '../agent-repo-mount.js';
 import { CODEX_TOOLCHAIN_FINGERPRINT, CODEX_TOOLCHAIN_SPEC } from '../codex-toolchain.js';
 import { OPENCODE_TOOLCHAIN_FINGERPRINT, OPENCODE_TOOLCHAIN_SPEC } from '../opencode-toolchain.js';
 import { findTrialDir, MAKA_SETTLEMENT_GRACE_SEC } from '../harbor-task-runner.js';
+import { readTrialCellLog } from '../trial-cell-log.js';
 import { MAKA_NODE_TOOLCHAIN_FINGERPRINT } from '../maka-node-toolchain.js';
 import type { ProviderRequestTelemetry } from '../provider-auth-proxy.js';
 import {
@@ -291,6 +292,39 @@ test('buildPierRunArgs emits the pier CLI contract for the Maka arm', () => {
   assert.ok(!args.includes('--env-file'));
 });
 
+// Same contract as the Harbor runner: the row names the directory this trial's
+// artifacts are actually in, proven by reading one back out of it.
+test('createPierTaskRunner records the trial it read', async () => {
+  await withDirs(async ({ jobsDir, repo }) => {
+    const logPath = join(jobsDir, 'trial-cells.jsonl');
+    const runner = createPierTaskRunner(
+      baseOptions({
+        jobsDir,
+        makaRepoPath: repo,
+        agent: 'maka',
+        makaNodeToolchainPath: '/toolchains/maka-node',
+        trialCellLogPath: logPath,
+        runPier: fakePier({ reward: 1 }),
+      }),
+    );
+
+    await runner(runInput());
+
+    const rows = await readTrialCellLog(logPath);
+    assert.equal(rows.length, 1);
+    assert.deepEqual(
+      { runId: rows[0]?.runId, roundId: rows[0]?.roundId, taskId: rows[0]?.taskId },
+      { runId: 'run-1', roundId: 'round-1', taskId: 'dasel' },
+    );
+    assert.equal(rows[0]?.agent, 'maka');
+    assert.equal(
+      JSON.parse(await readFile(join(rows[0]!.trialDir, 'agent', 'maka-cell-output.json'), 'utf8'))
+        .status,
+      'completed',
+    );
+  });
+});
+
 test('createPierTaskRunner gives Maka a controller-owned settlement tail', async () => {
   await withDirs(async ({ jobsDir, repo }) => {
     const captured: FakeOptions['captured'] = {};
@@ -526,7 +560,14 @@ test('createPierTaskRunner withholds the repo tree from a competitor arm', async
       return mounts.filter((mount) => mount.target.startsWith('/opt/maka-agent'));
     };
 
-    assert.ok((await repoMountsFor('maka')).some((mount) => mount.target === '/opt/maka-agent'));
+    // Maka executes out of its build outputs, not the repo root: a root mount
+    // is what let it read docs/eval and the verifier source in the #2245 run.
+    const maka = await repoMountsFor('maka');
+    assert.ok(maka.every((mount) => mount.target !== '/opt/maka-agent'));
+    assert.ok(
+      maka.some((mount) => mount.target === '/opt/maka-agent/packages/headless/dist'),
+      'maka must receive the build output it executes',
+    );
 
     // Pier shares agent-repo-mount with the Harbor runner precisely so this
     // cannot regress in one executor while the other stays fixed.

@@ -29,6 +29,74 @@ import {
 import { SQLITE_AGENT_GRAPH_CONTROL_TABLES } from '../sqlite-session-metadata-schema.js';
 
 describe('SqliteSessionMetadataStore', () => {
+  test('migration locks only legacy sessions that already contain a user message', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'maka-session-lock-migration-'));
+    const path = join(root, 'state.sqlite');
+    try {
+      const store = createSqliteSessionMetadataStore(path);
+      await store.create(fullHeader({ id: 'with-user', connectionLocked: false }));
+      await store.create(fullHeader({ id: 'assistant-only', connectionLocked: false }));
+      store.close();
+
+      const legacy = new DatabaseSync(path);
+      legacy
+        .prepare(`
+        INSERT INTO session_messages(
+          session_id, sequence, message_id, message_type, message_ts, record_json
+        ) VALUES (?, 0, ?, ?, 1, ?)
+      `)
+        .run(
+          'with-user',
+          'user-1',
+          'user',
+          JSON.stringify({
+            type: 'user',
+            id: 'user-1',
+            turnId: 'turn-1',
+            ts: 1,
+            text: 'hello',
+          }),
+        );
+      legacy
+        .prepare(`
+        INSERT INTO session_messages(
+          session_id, sequence, message_id, message_type, message_ts, record_json
+        ) VALUES (?, 0, ?, ?, 1, ?)
+      `)
+        .run(
+          'assistant-only',
+          'assistant-1',
+          'assistant',
+          JSON.stringify({
+            type: 'assistant',
+            id: 'assistant-1',
+            turnId: 'turn-1',
+            ts: 1,
+            text: 'preview',
+            modelId: 'fake-model',
+          }),
+        );
+      legacy
+        .prepare(`
+        UPDATE session_metadata_schema
+        SET version = ?
+        WHERE scope = 'session_metadata'
+      `)
+        .run(21);
+      legacy.close();
+
+      const migrated = createSqliteSessionMetadataStore(path);
+      try {
+        assert.equal((await migrated.read('with-user')).header.connectionLocked, true);
+        assert.equal((await migrated.read('assistant-only')).header.connectionLocked, false);
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test('round-trips every SessionHeader field and reopens the same schema', async () => {
     const root = await mkdtemp(join(tmpdir(), 'maka-session-metadata-'));
     const path = join(root, 'state.sqlite');
@@ -410,6 +478,10 @@ describe('SqliteSessionMetadataStore', () => {
     let rejectedRequestId: string | undefined;
     try {
       await store.create(fullHeader());
+      // Each request stays near MAX_SANDBOX_BOUNDARY_SERIALIZED_BYTES so the
+      // cumulative boundary crosses capacity in the fewest settles, using few
+      // near-MAX_SANDBOX_BOUNDARY_PATH_CHARS entries to keep the per-settle
+      // boundary scans cheap.
       for (let request = 0; request < 30; request += 1) {
         const requestId = `capacity-${request}`;
         await store.createSandboxBoundaryRequest({
@@ -418,8 +490,8 @@ describe('SqliteSessionMetadataStore', () => {
           turnId: 'turn-1',
           expansion: {
             filesystem: {
-              entries: Array.from({ length: 32 }, (_, entry) => ({
-                path: `/outside/${request}/${entry}-${'x'.repeat(1_800)}`,
+              entries: Array.from({ length: 15 }, (_, entry) => ({
+                path: `/outside/${request}/${entry}-${'x'.repeat(4_000)}`,
                 access: 'read' as const,
                 scope: 'exact' as const,
               })),
@@ -468,7 +540,7 @@ describe('SqliteSessionMetadataStore', () => {
         turnId: 'turn-1',
         expansion: {
           filesystem: {
-            entries: [{ path: join(tmpdir(), 'maka-output'), access: 'write', scope: 'exact' }],
+            entries: [{ path: '/tmp/maka-output', access: 'write', scope: 'exact' }],
           },
         },
         justification: 'Write a temporary output.',

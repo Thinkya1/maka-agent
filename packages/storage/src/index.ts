@@ -9,6 +9,8 @@ export {
   normalizeSessionHeader,
   projectSessionCatalogMessages,
 } from './session-store.js';
+export { importLegacySessionsOnce } from './legacy-session-import.js';
+export type { LegacySessionImportResult } from './legacy-session-import.js';
 export type {
   CreateStableSessionRequest,
   CreateStableSessionResult,
@@ -132,6 +134,7 @@ export * from './project-catalog.js';
 export * from './project-session-backfill.js';
 export * from './git-worktree-child-executor.js';
 export * from './managed-workspace-owner.js';
+export * from './pet-pack-store.js';
 export * from './session-bundle-policy.js';
 export * from './session-bundle-contract.js';
 export * from './session-bundle-manifest.js';

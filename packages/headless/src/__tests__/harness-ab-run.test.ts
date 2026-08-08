@@ -10,6 +10,7 @@ import { runHarnessAbComparison, runHarnessArmCohort } from '../harness-ab-run.j
 import type { HarnessAbArmId } from '../harness-ab-manifest.js';
 import { HarborInfraError } from '../harbor-task-runner.js';
 import { hashHeadlessSystemPrompt } from '../system-prompts.js';
+import { readScheduledCellLog, scheduledCellLogPath } from '../trial-cell-log.js';
 import { tokenSummary } from './helpers/cell-output-fixtures.js';
 
 describe('runHarnessAbComparison', () => {
@@ -133,6 +134,45 @@ describe('runHarnessAbComparison', () => {
         (await readdir(dir)).filter((name) => name.endsWith('.tsv')),
         [],
       );
+      // The grid a later reader bounds this run by: everything either
+      // invocation went to grade, and nothing the benchmark merely contains.
+      assert.deepEqual(
+        (await readScheduledCellLog(scheduledCellLogPath(dir))).map(
+          (cell) => `${cell.taskId}:${cell.agent}`,
+        ),
+        ['a:maka', 'b:maka', 'a:opencode', 'b:opencode', 'c:maka', 'c:opencode'],
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Written where the cohort is handed over to be run, so it names the cells
+  // this run went to grade — not the benchmark's whole task list, of which a
+  // run grades a slice, and not a wider grid an earlier invocation planned and
+  // died before reaching.
+  test('records the grid it is about to grade, and only that', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'maka-harness-ab-schedule-'));
+    try {
+      const promptPath = join(dir, 'empty-system-prompt.txt');
+      await writeFile(promptPath, '', 'utf8');
+      const calls: string[] = [];
+      await runHarnessAbComparison({
+        runId: 'glm-harness-ab',
+        runRoot: dir,
+        resultsJsonlPath: join(dir, 'results.jsonl'),
+        systemPromptPath: promptPath,
+        resumeFingerprint: 'sha256:manifest',
+        evaluationTasks: ['a', 'b'].map((id) => ({ id, path: `/tasks/${id}` })),
+        arms: [harnessArm('maka', calls), harnessArm('opencode', calls)],
+      });
+      assert.deepEqual(
+        (await readScheduledCellLog(scheduledCellLogPath(dir))).map(
+          (cell) => `${cell.taskId}:${cell.agent}`,
+        ),
+        ['a:maka', 'b:maka', 'a:opencode', 'b:opencode'],
+      );
+      assert.deepEqual(new Set(calls), new Set(['a:maka', 'b:maka', 'a:opencode', 'b:opencode']));
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -216,6 +256,56 @@ describe('runHarnessAbComparison', () => {
 
       await runHarnessAbComparison(adjudicatedRetry);
       assert.equal(failingAttempts, 2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('retries an infra-failed cell whose task id carries a dot', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'maka-harness-ab-dotted-retry-'));
+    try {
+      const promptPath = join(dir, 'empty-system-prompt.txt');
+      await writeFile(promptPath, '', 'utf8');
+      let failingAttempts = 0;
+      const calls: string[] = [];
+      const failingArm = harnessArm('maka', calls);
+      failingArm.harborRunner = async () => {
+        failingAttempts += 1;
+        throw new Error('container failed after launch');
+      };
+      const input = {
+        runId: 'glm-harness-ab',
+        runRoot: dir,
+        resultsJsonlPath: join(dir, 'results.jsonl'),
+        systemPromptPath: promptPath,
+        resumeFingerprint: 'sha256:manifest',
+        evaluationTasks: [
+          { id: 'install-windows-3.11', path: '/tasks/install-windows-3.11' },
+          { id: 'plain', path: '/tasks/plain' },
+        ],
+        arms: [failingArm, harnessArm('opencode', calls)] as const,
+      };
+
+      await runHarnessAbComparison(input);
+      assert.equal(failingAttempts, 2);
+
+      // The written round id normalizes the dot, so that is what an operator
+      // reads back out of results.jsonl and feeds to the retry.
+      await runHarnessAbComparison({
+        ...input,
+        retryAdjudicatedInfraRoundIdsOnce: ['ab-maka-r0-install-windows-3-11'],
+      });
+      assert.equal(failingAttempts, 3);
+
+      // An operator recovering a sweep hands over a batch of ids. Naming only
+      // the first offender makes fixing a list of typos one round-trip each.
+      await assert.rejects(
+        runHarnessAbComparison({
+          ...input,
+          retryAdjudicatedInfraRoundIdsOnce: ['ab-maka-r0-nope', 'ab-maka-r0-also-nope'],
+        }),
+        /unknown round ab-maka-r0-nope, ab-maka-r0-also-nope/,
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

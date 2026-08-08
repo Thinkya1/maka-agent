@@ -17,9 +17,6 @@ export type AppUpdateStatus =
       state: 'available';
       currentVersion: string;
       latestVersion: string;
-      releaseName?: string;
-      releaseUrl?: string;
-      publishedAt?: string;
     }
   | {
       state: 'downloading';
@@ -31,8 +28,6 @@ export type AppUpdateStatus =
       state: 'downloaded';
       currentVersion: string;
       latestVersion: string;
-      releaseName?: string;
-      downloadedFile?: string;
     }
   | { state: 'installing'; currentVersion: string; latestVersion: string }
   | {
@@ -59,13 +54,13 @@ export interface AppUpdateService {
   getStatus(): AppUpdateStatus;
   retryUpdateDownload(): Promise<AppUpdateStatus>;
   installUpdate(input: AppUpdateInstallRequest): Promise<AppUpdateInstallResult>;
-  openUpdateDownload(): Promise<{ ok: true } | { ok: false; reason: 'not_available' | 'open_failed' }>;
+  /** Check because the window regained focus, subject to a shared throttle. */
+  checkForUpdatesOnFocus(): Promise<void>;
 }
 
 interface AppUpdateServiceDeps {
   currentVersion: string;
   isPackaged: boolean;
-  openExternal(url: string): Promise<void>;
   updater?: AppUpdater;
   mockLatestVersion?: string;
   mockState?: 'available' | 'downloading' | 'downloaded';
@@ -74,12 +69,19 @@ interface AppUpdateServiceDeps {
   clock?: {
     setTimeout(callback: () => void, delayMs: number): unknown;
     clearTimeout(handle: unknown): void;
+    /** Time source for the focus-check throttle. */
+    now?(): number;
   };
 }
 
-const RELEASES_URL = 'https://github.com/Maka-Agent/maka-agent/releases/latest';
 const FIRST_UPDATE_CHECK_DELAY_MS = 10_000;
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
+/**
+ * Focus is a cheap, frequent signal, so it is throttled rather than trusted:
+ * alt-tabbing ten times in a minute must not mean ten update requests. The
+ * four-hour timer stays as the floor for a window that is never refocused.
+ */
+const UPDATE_CHECK_ON_FOCUS_MIN_INTERVAL_MS = 15 * 60 * 1000;
 
 function normalizeVersion(version: string): string {
   return version.trim().replace(/^v/i, '');
@@ -112,20 +114,6 @@ function updateInfoVersion(info: Pick<UpdateInfo, 'version'> | undefined): strin
   return typeof info?.version === 'string' ? normalizeVersion(info.version) : undefined;
 }
 
-function updateInfoReleaseName(info: UpdateInfo | undefined): string | undefined {
-  return typeof info?.releaseName === 'string' ? info.releaseName : undefined;
-}
-
-function updateInfoReleaseDate(info: UpdateInfo | undefined): string | undefined {
-  return typeof info?.releaseDate === 'string' ? info.releaseDate : undefined;
-}
-
-function updateInfoReleaseUrl(info: UpdateInfo | undefined): string | undefined {
-  const files = Array.isArray(info?.files) ? info.files : [];
-  const firstUrl = files.find((file) => typeof file.url === 'string')?.url;
-  return firstUrl ? new URL(firstUrl, RELEASES_URL).toString() : RELEASES_URL;
-}
-
 function progressFromInfo(info: ProgressInfo): AppUpdateProgress {
   return {
     percent: Math.max(0, Math.min(100, Number.isFinite(info.percent) ? info.percent : 0)),
@@ -144,8 +132,6 @@ function mockStatus(currentVersion: string, latestVersion: string, state: AppUpd
       state: 'downloaded',
       currentVersion,
       latestVersion,
-      releaseName: `Maka ${latestVersion}`,
-      downloadedFile: 'mock-update.zip',
     };
   }
   if (state === 'downloading') {
@@ -160,9 +146,6 @@ function mockStatus(currentVersion: string, latestVersion: string, state: AppUpd
     state: 'available',
     currentVersion,
     latestVersion,
-    releaseName: `Maka ${latestVersion}`,
-    releaseUrl: RELEASES_URL,
-    publishedAt: new Date().toISOString(),
   };
 }
 
@@ -185,6 +168,10 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     setTimeout: (callback: () => void, delayMs: number) => setTimeout(callback, delayMs),
     clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
   };
+  const now = (): number => clock.now?.() ?? Date.now();
+  // One record shared by both triggers. Keeping a separate timestamp per
+  // trigger would let a focus check fire seconds after a scheduled one.
+  let lastCheckStartedAt: number | undefined;
 
   const publish = (next: AppUpdateStatus): AppUpdateStatus => {
     status = next;
@@ -253,9 +240,6 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       state: 'available',
       currentVersion: deps.currentVersion,
       latestVersion: version,
-      releaseName: updateInfoReleaseName(info),
-      releaseUrl: updateInfoReleaseUrl(info),
-      publishedAt: updateInfoReleaseDate(info),
     });
   });
   updater.on('update-not-available', (info) => {
@@ -281,8 +265,6 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
       state: 'downloaded',
       currentVersion: deps.currentVersion,
       latestVersion: updateInfoVersion(event) ?? latestVersion() ?? deps.currentVersion,
-      releaseName: updateInfoReleaseName(event),
-      downloadedFile: event.downloadedFile,
     });
   });
   updater.on('error', (error) => {
@@ -305,6 +287,7 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     if (status.state === 'downloading' && !allowDuringDownload) return status;
     if (activeDownload && !allowDuringDownload) return status;
     if (checkInFlight) return checkInFlight;
+    lastCheckStartedAt = now();
     checkInFlight = updater
       .checkForUpdates()
       .then((result) => {
@@ -397,17 +380,29 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     }
   }
 
-  async function openUpdateDownload(): Promise<{ ok: true } | { ok: false; reason: 'not_available' | 'open_failed' }> {
-    const url = status.state === 'available' ? status.releaseUrl ?? RELEASES_URL : RELEASES_URL;
-    if (status.state === 'not-available' || status.state === 'idle' || status.state === 'checking') {
-      return { ok: false, reason: 'not_available' };
+  /**
+   * Check because the user came back to the window.
+   *
+   * The four-hour timer alone means a version published while the app sat
+   * open is not noticed until the next tick — which is what "the update did
+   * not show up" actually was. Focus is when the user is present and a restart
+   * prompt is least disruptive, so it is the right moment to look.
+   *
+   * Deliberately does NOT reset the scheduled timer: the two triggers stay
+   * independent and the shared throttle is what keeps them from doubling up.
+   */
+  async function checkForUpdatesOnFocus(): Promise<void> {
+    if (disposed || !started) return;
+    if (
+      lastCheckStartedAt !== undefined &&
+      now() - lastCheckStartedAt < UPDATE_CHECK_ON_FOCUS_MIN_INTERVAL_MS
+    ) {
+      return;
     }
-    try {
-      await deps.openExternal(url);
-      return { ok: true };
-    } catch {
-      return { ok: false, reason: 'open_failed' };
-    }
+    // No `allowDuringDownload`: a download already in flight is the update
+    // arriving, and re-checking mid-download is exactly what that guard exists
+    // to prevent.
+    await checkForUpdates();
   }
 
   return {
@@ -416,6 +411,6 @@ export function createAppUpdateService(deps: AppUpdateServiceDeps): AppUpdateSer
     getStatus: currentStatus,
     retryUpdateDownload,
     installUpdate,
-    openUpdateDownload,
+    checkForUpdatesOnFocus,
   };
 }

@@ -38,30 +38,31 @@ export function formatAbsoluteTimestamp(ts: number, locale: UiLocale): string {
   return createAbsoluteTimeFormat(locale).format(new Date(ts));
 }
 
-function createClockTimeFormat(locale: UiLocale): Intl.DateTimeFormat {
-  if (typeof Intl === 'undefined' || typeof Intl.DateTimeFormat !== 'function') {
-    return { format: (d: Date) => d.toISOString().slice(11, 16) } as unknown as Intl.DateTimeFormat;
-  }
-  return new Intl.DateTimeFormat(
-    uiLocaleToIntlLocale(locale),
-    { hour: '2-digit', minute: '2-digit', hour12: false },
-  );
-}
+/* `formatClockTime` (a 24-hour `HH:mm` for the user-message time) lived here
+   until the meta row moved to Astryx's `Timestamp`. Locking the hour cycle was
+   the app overriding a preference that belongs to the reader's system, which is
+   why `Timestamp` formats against the host locale and offers no hour-cycle
+   knob. Absolute readings now come from that component, not from a local bag of
+   `Intl` options. */
 
-/** Wall-clock `HH:mm` (24-hour), for the always-absolute user-message time. */
-export function formatClockTime(ts: number, locale: UiLocale): string {
-  return createClockTimeFormat(locale).format(new Date(ts));
-}
-
+/**
+ * A turn's duration, counted in whole seconds: `0s`, `25s`, `1m 54s`.
+ *
+ * Deliberately NOT tool-activity's `formatDuration`, which resolves below the
+ * second (`450 ms`, `8.2s`). That shape reports a span measured after the fact.
+ * A turn's duration is first read while it advances, one second at a time, in
+ * the live status line, and a counter must only show precision its own tick can
+ * deliver — a tenths digit driven by a one-second timer moves in visible jumps,
+ * and a millisecond reading claims an accuracy the interval never had. The
+ * settled turn's meta tooltip uses the same shape rather than a finer one, so a
+ * turn that read `25s` while it ran does not report a differently-rounded
+ * number afterwards. Seconds truncate rather than round so the counter never
+ * runs ahead of the time it reports.
+ */
 export function formatTurnDuration(ms: number): string {
-  // Same shape as tool-activity's formatDuration — the turn meta chip
-  // and tool cards sit stacked in one view;「1 m 0 s」vs「8.2s」read as
-  // two different products.
-  if (ms < 1000) return `${ms} ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
-  const m = Math.floor(ms / 60_000);
-  const s = Math.round((ms % 60_000) / 1000);
-  return `${m}m ${s}s`;
+  const totalSeconds = Math.floor(Math.max(0, ms) / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
 }
 
 export function turnAbortMarkerLabel(abortSource: string | undefined, locale: UiLocale): string {

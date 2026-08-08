@@ -6,6 +6,8 @@
  */
 
 import type { BackendKind } from './session.js';
+import type { RelayModelProfiles } from './model-thinking.js';
+import { CODEX_SUBSCRIPTION_UNSUPPORTED_CHATGPT_MODELS } from './codex-model-compatibility.js';
 import {
   CATALOG_PROVIDER_TYPES,
   PROVIDER_REGISTRY,
@@ -21,6 +23,7 @@ import {
 } from './provider-registry.js';
 
 export type { BackendKind } from './session.js';
+export { CODEX_SUBSCRIPTION_UNSUPPORTED_CHATGPT_MODELS };
 export {
   CATALOG_PROVIDER_TYPES,
   PROVIDER_REGISTRY,
@@ -59,23 +62,11 @@ export interface ModelInfo {
     /** Provider-hosted live web search, using this exact model and connection. */
     webSearch?: boolean;
   };
-  /**
-   * Voice is transport-sensitive: an `audio` modality alone does not prove
-   * that the configured provider wire can carry it. These fields are kept
-   * separate from the legacy chat capability booleans so routing can require
-   * metadata, endpoint role, and an implemented adapter at the same time.
-   */
+  /** Multimodal input/output support from provider catalog metadata. */
   modalities?: {
     input: Array<'text' | 'image' | 'audio'>;
     output: Array<'text' | 'image' | 'audio'>;
   };
-  endpointRoles?: Array<
-    'agent_chat' | 'audio_chat' | 'transcription' | 'realtime_voice' | 'speech_generation'
-  >;
-  transports?: Array<
-    'openai_chat_audio' | 'openai_audio_transcriptions' | 'openai_realtime' | 'provider_native'
-  >;
-  transcriptOutput?: boolean;
 }
 
 export type ModelDiscoverySource = 'fetched' | 'fallback';
@@ -96,6 +87,20 @@ export interface RuntimeExecutionConnection {
   baseUrl?: string;
   defaultModel: string;
   models?: ModelInfo[];
+  /**
+   * Per-model user declarations for an `openai-compatible` relay: the facts
+   * (offered thinking levels, vision enable/disable, context window) that
+   * neither the relay's /models report nor built-in metadata can decide
+   * (see `RelayModelProfile` in `model-thinking.ts`). First-class and typed —
+   * relay models are unknown to metadata and a catalog refresh rewrites
+   * `models[]` rows, so declarations live next to the user-edited fields.
+   * Invariants enforced at store boundaries: only `openai-compatible`
+   * connections carry profiles, and only for ids in `enabledModelIds`
+   * (disabling a model deletes its profile).
+   */
+  relayModelProfiles?: RelayModelProfiles;
+  /** Free-form, non-secret per-connection data; nothing reads a key unless it is shaped for the connection's provider type. */
+  extras?: Record<string, unknown>;
 }
 
 export interface LlmConnection extends RuntimeExecutionConnection {
@@ -113,7 +118,6 @@ export interface LlmConnection extends RuntimeExecutionConnection {
   lastTestMessage?: string;
   createdAt: number;
   updatedAt: number;
-  extras?: Record<string, unknown>;
 }
 
 /**
@@ -283,8 +287,6 @@ export interface ConnectionTestResult {
   statusCode?: number;
   errorClass?: ConnectionTestErrorClass;
 }
-
-export const CODEX_SUBSCRIPTION_UNSUPPORTED_CHATGPT_MODELS = new Set(['gpt-5-codex']);
 
 export const PROVIDER_DEFAULTS = PROVIDER_REGISTRY;
 
@@ -505,7 +507,10 @@ export interface CreateConnectionInput {
   providerType: ProviderType;
   baseUrl?: string;
   defaultModel?: string;
+  /** When omitted, falls back to the default model alone. */
+  enabledModelIds?: string[];
   apiKey?: string;
+  relayModelProfiles?: RelayModelProfiles;
   extras?: Record<string, unknown>;
 }
 
@@ -522,6 +527,12 @@ export interface UpdateConnectionInput {
   lastTestStatus?: ConnectionLastTestStatus;
   lastTestAt?: string;
   lastTestMessage?: string;
+  /**
+   * Replace the whole relay profiles table: absent leaves it untouched,
+   * `null` clears it outright, a table replaces it (with the usual rules —
+   * only `openai-compatible`, only for `enabledModelIds`).
+   */
+  relayModelProfiles?: RelayModelProfiles | null;
   extras?: Record<string, unknown>;
 }
 

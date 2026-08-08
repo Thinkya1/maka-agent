@@ -55,7 +55,6 @@ describe('Desktop backend tool surface', () => {
   it('uses the effective Agent surface as the complete child-runtime capability boundary', async () => {
     const agentTools = [
       tool('agent_spawn', 'subagent'),
-      tool('agent_swarm', 'subagent'),
       tool('agent_list', 'read'),
       tool('agent_output', 'read'),
     ];
@@ -347,15 +346,16 @@ describe('Desktop backend tool surface', () => {
     });
   });
 
-  it('omits every WebSearch implementation while privacy mode is active', async () => {
+  it('omits every web-reading implementation while privacy mode is active', async () => {
     const clientSearch = tool('WebSearch', 'web_read');
+    const webFetch = tool('WebFetch', 'web_read');
     const deepseek: LlmConnection = {
       ...connectionFor('deepseek-v4-flash'),
       providerType: 'deepseek',
       models: [{ id: 'deepseek-v4-flash', apiProtocol: 'openai-responses' }],
     };
     const deps = makeDeps({
-      builtinTools: [readTool, clientSearch],
+      builtinTools: [readTool, clientSearch, webFetch],
       getReadyConnection: async () => ({
         connection: deepseek,
         apiKey: 'deepseek-key',
@@ -383,6 +383,10 @@ describe('Desktop backend tool surface', () => {
 
     assert.equal(
       surface.selectedTools.some((candidate) => candidate.name === 'WebSearch'),
+      false,
+    );
+    assert.equal(
+      surface.selectedTools.some((candidate) => candidate.name === 'WebFetch'),
       false,
     );
   });

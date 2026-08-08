@@ -26,6 +26,7 @@ export * from './execution-inspect.js';
 export * from './interaction.js';
 export * from './project.js';
 export * from './subagent-workspace.js';
+export * from './pet.js';
 
 // events.ts
 export type {
@@ -92,6 +93,7 @@ export type {
 } from './user-question.js';
 export {
   decodeMessageContent,
+  aggregateMessageContents,
   failureClassFromCompleteStopReason,
   isAttachmentRef,
   isCanonicalAttachmentRef,
@@ -260,12 +262,15 @@ export type {
   GenericToolLedgerAppendValidation,
   ToolLedgerLane,
   ToolLedgerLaneValidation,
+  ToolLedgerRejectionCode,
   ToolLedgerScanOperation,
   ToolLedgerScanResult,
   ToolLedgerTransitionKind,
   ToolLedgerTransitionValidation,
 } from './tool-ledger-scanner.js';
 export {
+  ToolLedgerCorruptionError,
+  ToolLedgerRejectionError,
   scanToolLedger,
   validateGenericToolLedgerAppend,
   validateToolLedgerEventLane,
@@ -370,13 +375,13 @@ export {
   SUBAGENT_SESSION_SPAWN_SCHEMA_VERSION,
   TURN_STATUSES,
   childSessionsForParent,
-  filterLinkedSessionTree,
   projectLinkedSessionTree,
   STEP_LIMIT_NOTICE_TEXT,
   deriveTurnRecords,
   isSessionStatus,
   isSessionBlockedReason,
   isLinkedSubagentSession,
+  linkedSubagentParentSessionId,
   isSubagentSessionParent,
   isSubagentSessionRuntime,
   isSubagentSessionSpawn,
@@ -393,12 +398,25 @@ export {
 } from './tool-result-record-schema.js';
 
 // model-thinking.ts
-export type { ThinkingLevel } from './model-thinking.js';
+export type {
+  ConnectionThinkingContext,
+  RelayModelProfile,
+  RelayModelProfiles,
+  ThinkingLevel,
+} from './model-thinking.js';
 export {
+  DECLARABLE_RELAY_THINKING_LEVELS,
+  normalizeRelayModelProfiles,
+  pruneRelayModelProfiles,
+  relayModelProfile,
   THINKING_LEVELS,
   isThinkingLevel,
+  resolveThinkingLevel,
+  thinkingVariantsForConnection,
   thinkingVariantsForModel,
 } from './model-thinking.js';
+
+export type { ChatModelChoice } from './chat-model-choice.js';
 
 // agent-run.ts
 export type {
@@ -512,6 +530,15 @@ export {
   type UnifiedDiffRow,
   type UnifiedDiffRowKind,
 } from './unified-diff.js';
+export type {
+  GitReviewFile,
+  GitReviewFileStatus,
+  GitReviewMutationAction,
+  GitReviewMutationResult,
+  GitReviewReadResult,
+  GitReviewSnapshot,
+  GitReviewSource,
+} from './git-review.js';
 export { redactSecrets as displayRedactSecrets } from './display-redaction.js';
 export {
   SHELL_RUN_ID_MAX_CHARS,
@@ -1331,64 +1358,6 @@ export {
   stableLocalMemoryProposalId,
 } from './local-memory.js';
 
-// voice.ts (PR-VOICE-0) — core contract; no IPC/storage/provider/runtime/UI.
-export type {
-  VoiceCapabilitySnapshot,
-  VoiceCaptureCaps,
-  VoiceCaptureRequest,
-  VoiceInputMode,
-  VoiceNormalizeResult,
-  VoicePermissionStatus,
-  VoicePrivacyFlags,
-  VoiceReadinessReason,
-  VoiceSttProvider,
-  VoiceTranscriptPersistence,
-  VoiceTranscriptRequest,
-  VoiceTranscriptResult,
-  VoiceTranscriptSource,
-  VoiceTtsPolicy,
-  VoiceTtsProvider,
-  VoiceTtsRequest,
-  VoiceIntent,
-  VoiceAudioFormat,
-  EphemeralVoiceAudio,
-  VoiceModelRouteCapability,
-  VoiceRecognitionConfig,
-  VoiceRealtimeConfig,
-  VoiceSettings,
-  VoiceRoutePlan,
-  ResolveVoiceRouteInput,
-  VoiceBeginRequest,
-  VoiceBeginResult,
-  VoiceCapturedAudio,
-  VoiceFinishCaptureResult,
-  VoiceRealtimeClientSession,
-  VoiceCoordinatorToolName,
-  VoiceCoordinatorToolCall,
-} from './voice.js';
-export {
-  VOICE_MAX_AUDIO_BYTES,
-  VOICE_MAX_CAPTURE_DURATION_MS,
-  VOICE_MAX_CHANNELS,
-  VOICE_MAX_SAMPLE_RATE,
-  VOICE_MAX_TRANSCRIPT_CHARS,
-  VOICE_TTS_MAX_TEXT_CHARS,
-  VOICE_INPUT_MARKER,
-  defaultVoiceCapabilitySnapshot,
-  defaultVoiceCaptureCaps,
-  defaultVoicePrivacyFlags,
-  defaultVoiceSettings,
-  normalizeVoiceSettings,
-  resolveVoiceRoute,
-  normalizeVoiceCoordinatorToolCall,
-  normalizeVoiceInputMode,
-  normalizeVoiceTranscriptText,
-  normalizeVoiceTtsPolicy,
-  validateVoiceCaptureRequest,
-  validateVoiceTranscriptResult,
-  validateVoiceTtsRequest,
-} from './voice.js';
-
 // backend-types.ts
 export type {
   BackendSendInput,
@@ -1548,8 +1517,10 @@ export type {
 } from './bootstrap-connections.js';
 export {
   OPENCODE_FREE_BOOTSTRAP_VERSION,
+  OPENCODE_FREE_DEFAULT_ENABLED_MODELS,
   OPENCODE_FREE_DEFAULT_MODEL,
   OPENCODE_FREE_LEGACY_DEFAULT_MODEL,
+  defaultEnabledModelIdsWhenOmitted,
   resolveBootstrapConnections,
   resolveOpenCodeFreeBootstrapMigration,
 } from './bootstrap-connections.js';
@@ -1580,7 +1551,6 @@ export {
 export {
   modelMetadataIdsForProvider,
   resolveModelVisionSupport,
-  resolveModelVoiceMetadata,
 } from './model-metadata.js';
 export type {
   HostedWebSearchAdapter,
@@ -1874,6 +1844,13 @@ export {
   isSessionStartModeLabel,
   isDeepResearchSession,
 } from './explore-agent.js';
+
+// side-conversation.ts — transient fork boundary for read-only side chats.
+export {
+  SIDE_CONVERSATION_SESSION_LABEL,
+  buildSideConversationSystemPromptFragment,
+  isSideConversationSession,
+} from './side-conversation.js';
 
 // tool-catalog.ts — shared product tool vocabulary (#1099).
 export type {

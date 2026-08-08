@@ -34,6 +34,7 @@ import type {
 import type { AgentSpec } from '@maka/core/runtime-inputs';
 import type { PermissionMode, ToolCategory, ToolExecutionFacts } from '@maka/core/permission';
 import type { RuntimeExecutionConnection } from '@maka/core/llm-connections';
+import type { OrchestrationMode } from '@maka/core/orchestration';
 import type {
   UserQuestion,
   UserQuestionResponse,
@@ -159,6 +160,7 @@ export interface MakaTool<P = any, R = unknown> {
 export interface MakaToolContext {
   sessionId: string;
   runId?: string;
+  orchestrationMode?: OrchestrationMode;
   turnId: string;
   /** Session working directory. */
   cwd: string;
@@ -342,6 +344,7 @@ export interface ToolRuntimeInput {
    * different run by the time the tool executes (#1990).
    */
   runId?: string;
+  orchestrationMode?: OrchestrationMode;
   invocationId?: string;
   materializeDefaultToolResultOutput?: (options: {
     toolCallId: string;
@@ -496,6 +499,7 @@ export class ToolRuntime {
   private lastAmbiguousComputerSignature: string | undefined;
   private readonly recentSandboxDenials = new Set<string>();
   private readonly durableToolAttempts = new Map<string, DurableToolAttempt>();
+  private readonly activeToolSettlements = new Set<Promise<unknown>>();
   private readonly readExecutionBoundary: NonNullable<ToolRuntimeInput['readExecutionBoundary']>;
   private readonly stepAdmissions = new Map<
     string,
@@ -570,6 +574,14 @@ export class ToolRuntime {
       this.questionClosureDeferred = false;
     }
     this.resetTurnState();
+    // The stop path settles the run's terminal fact right after the
+    // backend's stop resolves, and that stop awaits this method. Unwinds
+    // already in flight commit their T2 outcomes on their own microtask
+    // chains, so wait for them here: the terminal event stays the ledger's
+    // immutable tail instead of racing an outcome in behind it (#2253).
+    // Bounded, not open-ended: every rejection above has already been
+    // dispatched, and running impls observe the turn abort signal.
+    await Promise.allSettled([...this.activeToolSettlements]);
     if (boundarySettlementErrors.length > 0) {
       throw new AggregateError(
         boundarySettlementErrors,
@@ -700,6 +712,19 @@ export class ToolRuntime {
    * turn-scoped provider resources such as the image budget.
    */
   async settleToolCallRaw(call: ResolvedMakaToolCall): Promise<RawToolSettlement> {
+    const settlement = this.performToolSettlement(call);
+    // Tracked so endTurn can wait out unwinds already in flight (#2253):
+    // their T2 outcomes must land before the stop path settles the run's
+    // terminal fact, and nested Code Mode calls route through here too.
+    // The caller observes the settlement itself; the tracking handler only
+    // removes the entry.
+    this.activeToolSettlements.add(settlement);
+    const untrack = () => this.activeToolSettlements.delete(settlement);
+    void settlement.then(untrack, untrack);
+    return settlement;
+  }
+
+  private async performToolSettlement(call: ResolvedMakaToolCall): Promise<RawToolSettlement> {
     const result = await this.executeTool(
       call.tool,
       call.turnId,
@@ -783,6 +808,7 @@ export class ToolRuntime {
       parentToolCallId?: string;
       parentOperationId?: string;
     } = {},
+    attempt?: DurableToolAttempt,
   ): Promise<void> {
     const content: ToolResultContent = {
       kind: 'text',
@@ -791,7 +817,16 @@ export class ToolRuntime {
       ...(sandboxFailure ? { sandboxFailure } : {}),
       ...(uncertainOutcome ? { uncertainOutcome } : {}),
     };
-    const durableAttempt = this.durableToolAttempts.get(durableAttemptKey(turnId, toolUseId));
+    // The executor passes its own attempt (#2253): a stop lands endTurn's
+    // resetTurnState before a parked tool unwinds, so by the time the
+    // rejection reaches the catch that writes this result, the map below is
+    // already empty. A result written without the attempt loses its
+    // operationId, and a response for a dispatched operation with no
+    // operation identity is exactly what the tool ledger refuses as
+    // identity_conflict. The map lookup remains for the pre-dispatch
+    // guards, where no attempt exists and no identity is owed.
+    const durableAttempt =
+      attempt ?? this.durableToolAttempts.get(durableAttemptKey(turnId, toolUseId));
     const durableOutcome = await durableAttempt?.commitOutcome(content, true);
     const msg: ToolResultMessage = {
       type: 'tool_result',
@@ -932,57 +967,41 @@ export class ToolRuntime {
       this.gating !== undefined &&
       this.gating.gatedNames.has(tool.name) &&
       !this.gating.activeNames().has(tool.name);
-    const rejectedBeforeClientBoundary =
-      admissionFailure !== undefined ||
-      permissionArgsError !== undefined ||
-      repeatedAmbiguousComputerTarget ||
-      repeatedFailedCall ||
-      deferredToolNotLoaded;
-    let clientCapabilityBoundary: ExecutionBoundary | undefined;
-    let clientCapabilityBoundaryReadFailed = false;
-    let clientCapabilityBoundaryReadError: unknown;
-    if (!rejectedBeforeClientBoundary && tool.categoryHint === 'client_capability') {
-      try {
-        clientCapabilityBoundary = await this.readExecutionBoundary();
-      } catch (error) {
-        clientCapabilityBoundaryReadFailed = true;
-        clientCapabilityBoundaryReadError = error;
-      }
-    }
-    const clientCapabilityBoundaryRejected =
-      clientCapabilityBoundaryReadFailed ||
-      (tool.categoryHint === 'client_capability' && clientCapabilityBoundary?.kind !== 'bypass');
-    const rejectedBeforeSubagentAdmission =
-      rejectedBeforeClientBoundary || clientCapabilityBoundaryRejected;
-    // Slot admission is part of preflight too. Reserve it before assigning a
-    // durable operation id so a saturated subagent call stays on the generic
-    // call/response lane just like every other pre-dispatch rejection.
-    const reservedSubagentSlot = !rejectedBeforeSubagentAdmission && this.reserveSubagentSlot(tool);
-    const preflightRejected = rejectedBeforeSubagentAdmission || !reservedSubagentSlot;
-
-    // Preflight rejection must remain on the generic call/response lane instead
-    // of claiming the T1 dispatch protocol. If the call carried an operationId
-    // here, AgentRun would (correctly) skip its generic projection assuming
-    // commitToolPrepared already persisted it; the synthetic response would
-    // then become an orphan.
-    const operationId =
-      this.input.runtimeCommitSink && invocationId && !preflightRejected
-        ? buildToolOperationId({ invocationId, providerToolCallId: toolUseId })
-        : undefined;
     const activityIdentity = {
       origin: ctx.origin,
       modelVisibility: ctx.origin === 'code_mode' ? ('hidden' as const) : ('visible' as const),
       ...(ctx.parentToolCallId ? { parentToolCallId: ctx.parentToolCallId } : {}),
       ...(ctx.parentOperationId ? { parentOperationId: ctx.parentOperationId } : {}),
     };
-    const startEv: ToolStartEvent = {
-      type: 'tool_start',
-      id: operationId ? `${operationId}_call` : this.input.newId(),
+    // Which lane carries this call's `function_call` fact is not knowable here.
+    // A pre-dispatch refusal — exclusive-step admission, arguments the schema
+    // rejects, either loop gate, a deferred tool used before its load, a
+    // boundary read, the subagent cap — never crosses T1, so its call and its
+    // synthetic response both belong on the generic call/response lane. Only a
+    // call that reaches `prepareDurableToolAttempt` may claim the T1 dispatch
+    // protocol, because only `commitToolPrepared` persists the call under that
+    // identity; tag a refusal and AgentRun skips the generic projection
+    // (`isAtomicToolBoundaryProjection`) waiting for a commit that never comes,
+    // leaving the response an `orphan_response` the ledger refuses — which took
+    // the whole turn down with it (#2234).
+    //
+    // The predecessor of this block answered that by predicting the refusals up
+    // front: every guard below was hoisted into a `preflightRejected` boolean
+    // read at construction time. It is correct only while the prediction and
+    // the guards agree, and nothing holds them together — a new refusal path,
+    // or a guard that grows a condition its hoisted twin does not, silently
+    // restores the orphan. Deciding at push time cannot drift, because the
+    // decision IS the code path taken.
+    const dispatchOperationId =
+      this.input.runtimeCommitSink && invocationId
+        ? buildToolOperationId({ invocationId, providerToolCallId: toolUseId })
+        : undefined;
+    const callEventFacts = {
+      type: 'tool_start' as const,
       turnId,
       ts: now,
       toolUseId,
       toolName: tool.name,
-      ...(operationId ? { operationId } : {}),
       ...activityIdentity,
       ...(tool.activityKind ? { activityKind: tool.activityKind } : {}),
       args: structuredClone(persistedArgs),
@@ -992,6 +1011,39 @@ export class ToolRuntime {
       ...(tool.displayName ? { displayName: tool.displayName } : {}),
       ...(toolIntent ? { intent: toolIntent } : {}),
       ...(stepId !== undefined ? { stepId } : {}),
+    };
+    let pushedCallEvent: ToolStartEvent | undefined;
+    const pushCallEvent = (lane: 'dispatch' | 'preflight'): ToolStartEvent => {
+      // Idempotent by construction: one call, one call event, whichever lane
+      // asks for it first. A second ask cannot mint a second id.
+      if (pushedCallEvent) return pushedCallEvent;
+      const operationId = lane === 'dispatch' ? dispatchOperationId : undefined;
+      const event: ToolStartEvent = {
+        ...callEventFacts,
+        id: operationId ? `${operationId}_call` : this.input.newId(),
+        ...(operationId ? { operationId } : {}),
+      };
+      queue.push(event);
+      pushedCallEvent = event;
+      return event;
+    };
+    /**
+     * One pre-dispatch refusal: the call fact on the generic lane, then the
+     * refusal the model reads, on the same lane. Every refusal below routes
+     * through here so the pair can never be split across lanes again.
+     */
+    const refuseBeforeDispatch = async (text: string): Promise<void> => {
+      pushCallEvent('preflight');
+      await this.writeSyntheticToolResult(
+        toolUseId,
+        turnId,
+        text,
+        queue,
+        undefined,
+        undefined,
+        undefined,
+        activityIdentity,
+      );
     };
     const callMsg: ToolCallMessage = {
       type: 'tool_call',
@@ -1011,29 +1063,14 @@ export class ToolRuntime {
       // timeline and post-restart backfill can pair this call with its step.
       ...(stepId !== undefined ? { stepId } : {}),
     };
-    try {
-      await this.input.appendMessage(callMsg);
-      queue.push(startEv);
-      trace?.emit('tool', 'tool_started', 'Tool execution started', {
-        toolUseId,
-        toolName: tool.name,
-        ...(tool.categoryHint !== undefined ? { categoryHint: tool.categoryHint } : {}),
-      });
-    } catch (error) {
-      if (reservedSubagentSlot) this.releaseSubagentSlot(tool);
-      throw error;
-    }
+    await this.input.appendMessage(callMsg);
+    trace?.emit('tool', 'tool_started', 'Tool execution started', {
+      toolUseId,
+      toolName: tool.name,
+      ...(tool.categoryHint !== undefined ? { categoryHint: tool.categoryHint } : {}),
+    });
     if (admissionFailure) {
-      await this.writeSyntheticToolResult(
-        toolUseId,
-        turnId,
-        admissionFailure,
-        queue,
-        undefined,
-        undefined,
-        undefined,
-        activityIdentity,
-      );
+      await refuseBeforeDispatch(admissionFailure);
       trace?.emit('tool', 'tool_failed', 'Tool rejected by exclusive-step admission', {
         toolUseId,
         toolName: tool.name,
@@ -1068,16 +1105,7 @@ export class ToolRuntime {
               args: executionArgs,
               error: permissionArgsError,
             });
-      await this.writeSyntheticToolResult(
-        toolUseId,
-        turnId,
-        msg,
-        queue,
-        undefined,
-        undefined,
-        undefined,
-        activityIdentity,
-      );
+      await refuseBeforeDispatch(msg);
       this.input.recordToolInvocation?.({
         sessionId: this.input.sessionId,
         turnId,
@@ -1129,16 +1157,7 @@ export class ToolRuntime {
     // streak stays parked and every further identical repeat stays blocked.
     if (repeatedAmbiguousComputerTarget) {
       const reason = formatAmbiguousComputerLoopGateText();
-      await this.writeSyntheticToolResult(
-        toolUseId,
-        turnId,
-        reason,
-        queue,
-        undefined,
-        undefined,
-        undefined,
-        activityIdentity,
-      );
+      await refuseBeforeDispatch(reason);
       trace?.emit('tool', 'tool_failed', 'Blocked repeated ambiguous Computer Use target', {
         toolUseId,
         toolName: tool.name,
@@ -1156,16 +1175,7 @@ export class ToolRuntime {
     }
     if (repeatedFailedCall) {
       const reason = formatLoopGateText(tool.name);
-      await this.writeSyntheticToolResult(
-        toolUseId,
-        turnId,
-        reason,
-        queue,
-        undefined,
-        undefined,
-        undefined,
-        activityIdentity,
-      );
+      await refuseBeforeDispatch(reason);
       trace?.emit('tool', 'tool_failed', 'Loop-gate blocked a repeated identical failing call', {
         toolUseId,
         toolName: tool.name,
@@ -1184,16 +1194,7 @@ export class ToolRuntime {
     // model loads via `load_tools`, then retries next step.
     if (deferredToolNotLoaded) {
       const reason = formatDeferredNotLoadedText(tool.name);
-      await this.writeSyntheticToolResult(
-        toolUseId,
-        turnId,
-        reason,
-        queue,
-        undefined,
-        undefined,
-        undefined,
-        activityIdentity,
-      );
+      await refuseBeforeDispatch(reason);
       trace?.emit('tool', 'tool_failed', 'Deferred tool used before load', {
         toolUseId,
         toolName: tool.name,
@@ -1204,19 +1205,13 @@ export class ToolRuntime {
       return this.errorReturn(reason);
     }
 
+    let clientCapabilityBoundary: ExecutionBoundary | undefined;
     if (tool.categoryHint === 'client_capability') {
-      if (clientCapabilityBoundaryReadFailed) {
-        const reason = formatSyntheticToolErrorText(clientCapabilityBoundaryReadError);
-        await this.writeSyntheticToolResult(
-          toolUseId,
-          turnId,
-          reason,
-          queue,
-          undefined,
-          undefined,
-          undefined,
-          activityIdentity,
-        );
+      try {
+        clientCapabilityBoundary = await this.readExecutionBoundary();
+      } catch (error) {
+        const reason = formatSyntheticToolErrorText(error);
+        await refuseBeforeDispatch(reason);
         trace?.emit('tool', 'tool_failed', 'Client Capability boundary read failed', {
           toolUseId,
           toolName: tool.name,
@@ -1226,17 +1221,8 @@ export class ToolRuntime {
         this.recordLoopGateOutcome(callSignature, true);
         return this.errorReturn(reason);
       }
-      if (clientCapabilityBoundary?.kind !== 'bypass') {
-        await this.writeSyntheticToolResult(
-          toolUseId,
-          turnId,
-          CLIENT_CAPABILITY_BOUNDARY_MESSAGE,
-          queue,
-          undefined,
-          undefined,
-          undefined,
-          activityIdentity,
-        );
+      if (clientCapabilityBoundary.kind !== 'bypass') {
+        await refuseBeforeDispatch(CLIENT_CAPABILITY_BOUNDARY_MESSAGE);
         trace?.emit('tool', 'tool_failed', 'Client Capability blocked by execution boundary', {
           toolUseId,
           toolName: tool.name,
@@ -1248,6 +1234,7 @@ export class ToolRuntime {
       }
     }
 
+    const reservedSubagentSlot = this.reserveSubagentSlot(tool);
     if (!reservedSubagentSlot) {
       trace?.emit('tool', 'tool_failed', 'Tool execution rejected by runtime limit', {
         toolUseId,
@@ -1255,16 +1242,7 @@ export class ToolRuntime {
         errorClass: 'RuntimeLimit',
         boundary: 'subagent_tool_admission',
       });
-      await this.writeSyntheticToolResult(
-        toolUseId,
-        turnId,
-        SUBAGENT_TOOL_LIMIT_MESSAGE,
-        queue,
-        undefined,
-        undefined,
-        undefined,
-        activityIdentity,
-      );
+      await refuseBeforeDispatch(SUBAGENT_TOOL_LIMIT_MESSAGE);
       this.recordLoopGateOutcome(callSignature, true);
       return this.errorReturn(SUBAGENT_TOOL_LIMIT_MESSAGE);
     }
@@ -1273,7 +1251,7 @@ export class ToolRuntime {
     try {
       durableAttempt = await this.prepareDurableToolAttempt({
         tool,
-        startEvent: startEv,
+        startEvent: pushCallEvent('dispatch'),
         persistedArgs,
         modelFacingArgs,
         abortSignal: ctx.abortSignal,
@@ -1320,11 +1298,16 @@ export class ToolRuntime {
           sessionId: this.input.sessionId,
           turnId,
           ...(runId ? { runId } : {}),
+          ...(this.input.orchestrationMode
+            ? { orchestrationMode: this.input.orchestrationMode }
+            : {}),
           cwd: this.input.header.cwd,
           executionBoundary,
           permissionMode: this.input.header.permissionMode,
           toolCallId: toolUseId,
-          ...(operationId ? { operationId } : {}),
+          // The id the call event actually carries, not the candidate: by here
+          // `prepareDurableToolAttempt` has pushed it on the dispatch lane.
+          ...(pushedCallEvent?.operationId ? { operationId: pushedCallEvent.operationId } : {}),
           abortSignal: ctx.abortSignal,
           emitOutput: output.emit,
           ...(trace
@@ -1596,6 +1579,7 @@ export class ToolRuntime {
         sandboxBoundaryFailureSignal(sandboxError),
         uncertainOutcome,
         activityIdentity,
+        durableAttempt,
       );
       this.input.recordToolInvocation?.({
         sessionId: this.input.sessionId,

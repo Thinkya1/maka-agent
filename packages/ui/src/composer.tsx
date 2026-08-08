@@ -11,15 +11,16 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from 'react';
+import type { LucideIcon } from './icons.js';
 import { useMountedRef } from './use-mounted-ref.js';
 import {
   ArrowUp,
   FileText,
   ListTodo,
-  Mic,
   Network,
   Pencil,
   Plus,
+  Square,
   Sparkles,
   Upload,
   Workflow,
@@ -57,7 +58,9 @@ import {
   ChatComposerDrawer,
   ChatComposerInput,
   IconButton,
+  Lightbox,
   Token,
+  Tooltip,
   useChatPasteAsToken,
   type ChatComposerInputHandle,
   type ChatComposerToken,
@@ -71,6 +74,8 @@ import {
   DropdownMenuItem,
 } from '@astryxdesign/core/DropdownMenu';
 import { PermissionModeSelect } from './permission-mode-menu.js';
+import { AttachmentKindIcon } from './attachment-kinds.js';
+import { formatPreviewSize } from './artifact-preview-registry.js';
 import {
   inlineReferenceFileBasename,
   inlineReferenceToken,
@@ -87,6 +92,19 @@ export interface ComposerSkillOption {
   name: string;
   description?: string;
 }
+
+export interface ComposerSlashCommandOption {
+  id: string;
+  name: string;
+  description?: string;
+  keywords?: readonly string[];
+  Icon?: LucideIcon;
+  onSelect(): void;
+}
+
+type ComposerSlashSuggestion =
+  | { kind: 'command'; command: ComposerSlashCommandOption }
+  | { kind: 'skill'; skill: ComposerSkillOption };
 
 /**
  * The draft text a chosen Skill becomes. This is the product-wide invocation
@@ -119,6 +137,15 @@ function skillTokenValue(id: string): string {
  * rows before it scrolls; rows, not pixels, is the knob upstream exposes.
  */
 const COMPOSER_MAX_ROWS = 10;
+
+/** Uppercased extension for the staged-file card's meta line ("EPUB · 621.0 KB").
+ *  Null when the name has no usable extension, so the meta line is size-only. */
+function attachmentExtensionLabel(name: string): string | null {
+  const idx = name.lastIndexOf('.');
+  if (idx <= 0 || idx === name.length - 1) return null;
+  const ext = name.slice(idx + 1);
+  return ext.length > 8 ? null : ext.toUpperCase();
+}
 
 /**
  * PR-UI-15 (@yuejing 2026-05-22): Composer copy is locale-aware.
@@ -184,14 +211,33 @@ export const Composer = forwardRef<
       text: string,
       metadata?: ComposerSendMetadata,
     ): boolean | void | Promise<boolean | void>;
+    /** Insert a text-only instruction into the active turn at its next step boundary. */
+    onSteer?(
+      text: string,
+      metadata?: ComposerSendMetadata,
+    ): boolean | void | Promise<boolean | void>;
     onStop(): void | Promise<void>;
     onPickAttachments?(): void | Promise<void>;
     onAttachFilePaths?(files: File[]): void | Promise<void>;
-    pendingAttachments?: readonly { displayName: string; kind: AttachmentRef['kind']; mimeType?: string; size: number }[];
+    pendingAttachments?: readonly {
+      displayName: string;
+      kind: AttachmentRef['kind'];
+      mimeType?: string;
+      size: number;
+      /** Renderer-resolvable image source (object/data URL) for `kind: 'image'`
+       *  previews. When set, the chip is clickable and opens the image in a
+       *  Lightbox; while absent (still loading, or preview failed) the chip is
+       *  inert like any other kind. */
+      previewUrl?: string;
+    }[];
     onRemoveAttachment?(index: number): void;
     /** Quoted excerpts staged for the next send; rendered as removable chips. */
     pendingQuotes?: readonly QuoteRef[];
     onRemoveQuote?(index: number): void;
+    /** Start staged context collapsed on compact secondary composer surfaces. */
+    contextDrawerDefaultCollapsed?: boolean;
+    /** Hide the unavailable dot when an inherited model is intentionally read-only. */
+    showStaticModelUnavailableStatus?: boolean;
     /**
      * Stage a reference-sized paste as a quote chip rather than letting it
      * flood the textarea. Omitted by hosts that don't compose quotes, in which
@@ -289,19 +335,6 @@ export const Composer = forwardRef<
     graphModePending?: boolean;
     graphModeDisabledReason?: string;
     onGraphModeChange?(active: boolean): void | Promise<void>;
-    voiceCaptureState?: 'idle' | 'requesting' | 'recording' | 'processing' | 'native_ready' | 'sending';
-    /** @deprecated Quiet composer drops realtime chrome; retained for host compatibility. */
-    realtimeVoiceState?: 'idle' | 'connecting' | 'connected';
-    voiceProviderLabel?: string;
-    /**
-     * When provided (and the host has recognition configured), a single mic
-     * appears left of Send. Omitted by default so unconfigured voice is not a
-     * dead control.
-     */
-    onToggleVoiceCapture?(input?: { dictate?: boolean }): void | Promise<void>;
-    onCancelVoiceCapture?(): void;
-    /** @deprecated Realtime voice is not rendered in the quiet composer. */
-    onToggleRealtimeVoice?(): void | Promise<void>;
     /**
      * Composer mention popups. Both are optional and the whole feature no-ops
      * when absent (SSR contracts render Composer with minimal props):
@@ -313,6 +346,7 @@ export const Composer = forwardRef<
      *   - `onSearchMentionFiles` powers the `@` popup.
      */
     mentionSkills?: ReadonlyArray<ComposerSkillOption>;
+    slashCommands?: ReadonlyArray<ComposerSlashCommandOption>;
     onSearchMentionFiles?(query: string): Promise<ReadonlyArray<{ relativePath: string }>>;
   }
 >(function Composer(props, ref) {
@@ -566,11 +600,6 @@ export const Composer = forwardRef<
   const locale = useUiLocale();
   const copy = getConversationCopy(locale).composer;
   const mentionCopy = getConversationCopy(locale).mentions;
-  const voiceCaptureLabel = props.voiceCaptureState === 'recording'
-    ? copy.voiceStopRecording
-    : props.voiceCaptureState === 'native_ready'
-      ? copy.voiceSend
-      : copy.voiceStart;
 
   useEffect(() => {
     return () => {
@@ -647,11 +676,13 @@ export const Composer = forwardRef<
   // through this ref instead.
   const mentionSourceRef = useRef({
     mentionSkills: props.mentionSkills,
+    slashCommands: props.slashCommands,
     onSearchMentionFiles: props.onSearchMentionFiles,
   });
   useEffect(() => {
     mentionSourceRef.current = {
       mentionSkills: props.mentionSkills,
+      slashCommands: props.slashCommands,
       onSearchMentionFiles: props.onSearchMentionFiles,
     };
   });
@@ -668,21 +699,41 @@ export const Composer = forwardRef<
       );
     };
     const files = createTriggerSearchSource<SearchableItem>(runFileSearch);
-    const listSkills = (rawQuery: string): SearchableItem[] => {
+    const listSlashSuggestions = (rawQuery: string): SearchableItem[] => {
       const skills = mentionSourceRef.current.mentionSkills ?? [];
+      const commands = mentionSourceRef.current.slashCommands ?? [];
       const query = skillMentionQuery(rawQuery);
-      return skills
+      const commandItems = commands
+        .filter((command) =>
+          mentionQueryMatches(
+            query,
+            `${command.id} ${command.name} ${command.description ?? ''} ${(command.keywords ?? []).join(' ')}`,
+          ),
+        )
+        .map((command) => ({
+          id: `command:${command.id}`,
+          label: command.name,
+          auxiliaryData: { kind: 'command', command } satisfies ComposerSlashSuggestion,
+        }));
+      const skillItems = skills
         .filter((skill) =>
           mentionQueryMatches(query, `${skill.id} ${skill.name} ${skill.description ?? ''}`),
         )
-        .slice(0, 50)
-        .map((skill) => ({ id: skill.id, label: skill.name, auxiliaryData: skill }));
+        .map((skill) => ({
+          id: `skill:${skill.id}`,
+          label: skill.name,
+          auxiliaryData: { kind: 'skill', skill } satisfies ComposerSlashSuggestion,
+        }));
+      return [...commandItems, ...skillItems].slice(0, 50);
     };
     // `bootstrap` is required by SearchSource but never called by
     // `useTriggerMenu`; the menu opens straight into `search`.
     searchSourcesRef.current = {
       files,
-      skills: { bootstrap: () => listSkills(''), search: listSkills },
+      skills: {
+        bootstrap: () => listSlashSuggestions(''),
+        search: listSlashSuggestions,
+      },
     };
   }
 
@@ -722,17 +773,26 @@ export const Composer = forwardRef<
           inlineReferenceToken(workspaceFileInlineReference(item.id)),
       });
     }
-    if (props.mentionSkills !== undefined) {
+    if (
+      props.mentionSkills !== undefined ||
+      (props.slashCommands?.length ?? 0) > 0
+    ) {
       list.push({
         character: '/',
         searchSource: sources.skills,
-        menuLabel: mentionCopy.skillsAriaLabel,
-        emptySearchResultsText: mentionCopy.noSkills,
+        menuLabel:
+          (props.slashCommands?.length ?? 0) > 0
+            ? mentionCopy.commandsAndSkillsAriaLabel
+            : mentionCopy.skillsAriaLabel,
+        emptySearchResultsText:
+          (props.slashCommands?.length ?? 0) > 0
+            ? mentionCopy.noCommandsOrSkills
+            : mentionCopy.noSkills,
         loadingText: mentionCopy.loading,
         // Name over description, and no id: the second line is one line wide,
         // and the id spent a dozen characters of it on a string nobody types
         // here — the menu is how you avoid typing it. It stays searchable
-        // (`listSkills` matches against it) and it is still what the chip
+        // (the slash source matches against it) and it is still what the chip
         // serializes to; it just no longer crowds out the sentence that tells
         // two Skills apart.
         //
@@ -741,7 +801,29 @@ export const Composer = forwardRef<
         // and none carries one on hover. A `/` menu is driven with ↑↓, so a
         // hover-only description would be invisible to the way it is used.
         renderItem: (item) => {
-          const skill = item.auxiliaryData as ComposerSkillOption;
+          const suggestion = item.auxiliaryData as ComposerSlashSuggestion;
+          if (suggestion.kind === 'command') {
+            const { command } = suggestion;
+            const Icon = command.Icon;
+            return (
+              <>
+                {Icon ? (
+                  <Icon
+                    size={14}
+                    aria-hidden="true"
+                    className="maka-composer-mention-icon"
+                  />
+                ) : null}
+                <span className="maka-composer-mention-text">
+                  <span className="maka-composer-mention-name">{command.name}</span>
+                  <span className="maka-composer-mention-secondary">
+                    {command.description}
+                  </span>
+                </span>
+              </>
+            );
+          }
+          const { skill } = suggestion;
           return (
             <>
               <Sparkles size={14} aria-hidden="true" className="maka-composer-mention-icon" />
@@ -767,18 +849,29 @@ export const Composer = forwardRef<
         //
         // No colour: Maka blue is the single product accent, and a staged
         // Skill is identified by its sparkle and its label.
-        onSelect: (item): ChatComposerToken =>
-          inlineReferenceToken({
+        onSelect: (item): string | ChatComposerToken => {
+          const suggestion = item.auxiliaryData as ComposerSlashSuggestion;
+          if (suggestion.kind === 'command') {
+            suggestion.command.onSelect();
+            return '';
+          }
+          return inlineReferenceToken({
             kind: 'skill',
-            value: skillTokenValue(item.id),
-            label: (item.auxiliaryData as ComposerSkillOption).name,
-          }),
+            value: skillTokenValue(suggestion.skill.id),
+            label: suggestion.skill.name,
+          });
+        },
       });
     }
     return list;
     // The sources live in a ref, so only the localized copy, provider presence,
     // and the Skill projection identity (see the refresh effect below) matter.
-  }, [locale, Boolean(props.onSearchMentionFiles), props.mentionSkills]);
+  }, [
+    locale,
+    Boolean(props.onSearchMentionFiles),
+    props.mentionSkills,
+    props.slashCommands,
+  ]);
 
   /**
    * A visible `/` menu must never keep offering a Skill the host has since
@@ -791,7 +884,7 @@ export const Composer = forwardRef<
     const editable = editableNode();
     if (editable?.getAttribute('aria-expanded') !== 'true') return;
     editable.dispatchEvent(new Event('input', { bubbles: true }));
-  }, [props.mentionSkills]);
+  }, [props.mentionSkills, props.slashCommands]);
 
   /**
    * An open menu must follow the caret, not just the text. `useTriggerMenu`
@@ -902,7 +995,8 @@ export const Composer = forwardRef<
     setSendPending(true);
     let sent: boolean | void;
     try {
-      sent = await props.onSend(
+      const submit = props.streaming && props.onSteer ? props.onSteer : props.onSend;
+      sent = await submit(
         text,
         workspaceFileReferences.length > 0 ? { workspaceFileReferences } : undefined,
       );
@@ -915,10 +1009,20 @@ export const Composer = forwardRef<
     // Save to both local ref and global persistence so the history
     // survives page reloads and is shared across all input surfaces.
     rememberSentEntry(text);
-    clearDraft(submittedDraftKey);
     // The owner may have changed while onSend awaited (new-session creation,
     // revision branch, or user navigation). Never erase a foreign draft.
-    if (activeDraftKey() !== submittedDraftKey) return;
+    if (activeDraftKey() !== submittedDraftKey) {
+      clearDraft(submittedDraftKey);
+      return;
+    }
+    // The user can begin the next message while the send IPC is still
+    // resolving. Clear only the exact draft that was submitted; a newer value
+    // belongs to the next send and must survive this older completion.
+    if (composerWireText(textPort.getValue()) !== text) {
+      saveCurrentDraft(textPort.getValue());
+      return;
+    }
+    clearDraft(submittedDraftKey);
     textPort.setValue('');
     saveCurrentDraft('');
   }
@@ -955,15 +1059,6 @@ export const Composer = forwardRef<
       event.currentTarget.dispatchEvent(
         new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
       );
-      return;
-    }
-    if (
-      event.key === 'Escape' &&
-      props.voiceCaptureState &&
-      props.voiceCaptureState !== 'idle'
-    ) {
-      event.preventDefault();
-      props.onCancelVoiceCapture?.();
       return;
     }
     // Esc while a drag-active highlight is showing should clear it
@@ -1109,6 +1204,24 @@ export const Composer = forwardRef<
    */
   const drawerTokenCount =
     (props.pendingQuotes?.length ?? 0) + (props.pendingAttachments?.length ?? 0);
+  /** The last staged image opened from a chip (Lightbox media shape). Kept
+   *  mounted after close — see the Lightbox render — so only the open flag
+   *  drives visibility. */
+  const [attachmentLightbox, setAttachmentLightbox] = useState<{
+    src: string;
+    alt: string;
+    caption: string;
+  } | null>(null);
+  const [attachmentLightboxOpen, setAttachmentLightboxOpen] = useState(false);
+  useEffect(() => {
+    if (attachmentLightboxOpen || !attachmentLightbox) return;
+    // Unmount one commit AFTER the closed render, never in it: child effects
+    // run first, so Astryx has already executed dialog.close() — the native
+    // hand-back of focus to the chip button — by the time this fires. The
+    // deferred unmount also keeps the DOM to a single .astryx-lightbox for
+    // the chat transcript's own lightbox.
+    setAttachmentLightbox(null);
+  }, [attachmentLightboxOpen, attachmentLightbox]);
   /**
    * The session modes that are currently on, in the order the ＋ menu lists
    * them. The menu stays the switch — it turns each mode on *and* off; these
@@ -1179,7 +1292,6 @@ export const Composer = forwardRef<
     || props.onSwarmModeChange
     || props.onGraphModeChange,
   );
-  const showVoiceCapture = Boolean(props.onToggleVoiceCapture) && !props.streaming;
 
   return (
     <>
@@ -1240,8 +1352,47 @@ export const Composer = forwardRef<
           onSubmit={() => {}}
           isDisabled={props.disabled}
           drawer={drawerTokenCount > 0 ? (
-            <ChatComposerDrawer count={drawerTokenCount} label={copy.addContext}>
-              <div className="maka-composer-context-drawer" role="group" aria-label={copy.addContext}>
+            <ChatComposerDrawer
+              className="maka-composer-drawer"
+              count={drawerTokenCount}
+              label={copy.stagedContext}
+              defaultIsCollapsed={props.contextDrawerDefaultCollapsed}
+              // The collapse band's tooltip (composer.css ::after) follows the
+              // pointer instead of sitting at a fixed offset — on a full-width
+              // band a fixed bubble can be half a window away from the cursor.
+              // The custom property feeds the ::after's `left`; clamped so the
+              // bubble never crosses the band's right edge.
+              onPointerMove={(event) => {
+                const toggle = event.currentTarget.querySelector<HTMLElement>(
+                  '[role="button"][aria-controls]',
+                );
+                if (!toggle) return;
+                const band = toggle.getBoundingClientRect();
+                if (event.clientY < band.top || event.clientY > band.bottom) return;
+                // Clamp against the bubble's border-box: computed width is
+                // content-box only, so the paddings must be priced in or the
+                // right edge overshoots by exactly their sum.
+                const bubbleStyle = getComputedStyle(toggle, '::after');
+                const bubbleWidth =
+                  (Number.parseFloat(bubbleStyle.width) || 124) +
+                  (Number.parseFloat(bubbleStyle.paddingLeft) || 0) +
+                  (Number.parseFloat(bubbleStyle.paddingRight) || 0);
+                const x = Math.min(
+                  Math.max(event.clientX - band.left + 14, 8),
+                  Math.max(8, band.width - bubbleWidth - 8),
+                );
+                toggle.style.setProperty('--maka-drawer-tooltip-x', `${x}px`);
+              }}
+              // Without this, keyboard focus after a hover would show the
+              // bubble at the last pointer position instead of the
+              // beside-the-pill fallback.
+              onPointerLeave={(event) => {
+                event.currentTarget
+                  .querySelector<HTMLElement>('[role="button"][aria-controls]')
+                  ?.style.removeProperty('--maka-drawer-tooltip-x');
+              }}
+            >
+              <div className="maka-composer-context-drawer" role="group" aria-label={copy.stagedContext}>
                 {props.pendingQuotes?.map((quote, index) => (
                   <Token
                     key={`${quote.sourceTurnId ?? 'quote'}-${index}`}
@@ -1250,14 +1401,59 @@ export const Composer = forwardRef<
                     onRemove={props.onRemoveQuote ? () => props.onRemoveQuote?.(index) : undefined}
                   />
                 ))}
-                {props.pendingAttachments?.map((attachment, index) => (
-                  <Token
-                    key={`${attachment.displayName}-${index}`}
-                    size="sm"
-                    label={attachment.displayName}
-                    onRemove={props.onRemoveAttachment ? () => props.onRemoveAttachment?.(index) : undefined}
-                  />
-                ))}
+                {props.pendingAttachments?.map((attachment, index) => {
+                  const onRemove = props.onRemoveAttachment
+                    ? () => props.onRemoveAttachment?.(index)
+                    : undefined;
+                  // Astryx-standard rendering (maintainer decision on #2367's
+                  // follow-up): every attachment is a Token in the same chip
+                  // rhythm as quotes — kind icon + truncated name. The full
+                  // name and «EXT · size» meta live in a hover/focus Tooltip,
+                  // and an image with a decoded preview opens it in a
+                  // Lightbox on click instead of rendering an inline
+                  // thumbnail.
+                  const extension = attachmentExtensionLabel(attachment.displayName);
+                  const sizeLabel = formatPreviewSize(attachment.size, locale);
+                  // One string for both surfaces (chip tooltip + lightbox
+                  // caption), so the wording cannot drift between them.
+                  const detail = `${attachment.displayName} · ${
+                    extension ? `${extension} · ${sizeLabel}` : sizeLabel
+                  }`;
+                  const previewUrl =
+                    attachment.kind === 'image' ? attachment.previewUrl : undefined;
+                  return (
+                    <Tooltip
+                      key={`${attachment.displayName}-${index}`}
+                      content={detail}
+                      // "always", not the default "auto": the tooltip anchors
+                      // Token's non-focusable root span, so auto would never
+                      // attach focus listeners. focusin bubbles from the
+                      // chip's inner buttons, giving keyboard users the same
+                      // metadata hover shows.
+                      focusTrigger="always"
+                    >
+                      <Token
+                        size="sm"
+                        className="maka-composer-attachment-token"
+                        icon={<AttachmentKindIcon kind={attachment.kind} />}
+                        label={attachment.displayName}
+                        onRemove={onRemove}
+                        onClick={
+                          previewUrl
+                            ? () => {
+                                setAttachmentLightbox({
+                                  src: previewUrl,
+                                  alt: attachment.displayName,
+                                  caption: detail,
+                                });
+                                setAttachmentLightboxOpen(true);
+                              }
+                            : undefined
+                        }
+                      />
+                    </Tooltip>
+                  );
+                })}
               </div>
             </ChatComposerDrawer>
           ) : undefined}
@@ -1455,7 +1651,11 @@ export const Composer = forwardRef<
                     onPick={props.onPickNewChatModel}
                   />
                 ) : (
-                  <ModelChipStatic label={modelChipLabel} onOpenSettings={props.onOpenModelSettings} />
+                  <ModelChipStatic
+                    label={modelChipLabel}
+                    onOpenSettings={props.onOpenModelSettings}
+                    showUnavailableStatus={props.showStaticModelUnavailableStatus}
+                  />
                 )}
                 {props.activeSession ? (
                   <ThinkingLevelSelector
@@ -1521,31 +1721,35 @@ export const Composer = forwardRef<
             </div>
           )}
           sendActions={(
-            <div className="maka-composer-right-controls">
-              {showVoiceCapture ? (
-                <IconButton
-                  variant="ghost"
-                  type="button"
-                  size="sm"
-                  className="maka-composer-voice-button"
-                  data-state={props.voiceCaptureState ?? 'idle'}
-                  isDisabled={
-                    props.disabled
-                    || props.voiceCaptureState === 'requesting'
-                    || props.voiceCaptureState === 'processing'
-                    || props.voiceCaptureState === 'sending'
-                  }
-                  label={voiceCaptureLabel}
-                  tooltip={`${voiceCaptureLabel}${props.voiceProviderLabel ? ` · ${props.voiceProviderLabel}` : ''}`}
-                  onClick={(event) => {
-                    void props.onToggleVoiceCapture?.({ dictate: event.shiftKey });
-                  }}
-                  icon={<Mic size={15} aria-hidden="true" />}
-                />
-              ) : null}
-            </div>
+            <div className="maka-composer-right-controls" />
           )}
-          sendButton={props.streaming ? (
+          sendButton={props.streaming && props.onSteer ? (
+            <div className="maka-composer-running-actions">
+              <IconButton
+                variant="ghost"
+                type="button"
+                isDisabled={props.stopPending}
+                label={props.stopPending ? copy.stopping : copy.stopLabel}
+                aria-busy={props.stopPending ? 'true' : undefined}
+                data-pending={props.stopPending ? 'true' : undefined}
+                onClick={() => {
+                  if (props.stopPending) return;
+                  void props.onStop();
+                }}
+                icon={<Square size={14} aria-hidden="true" />}
+              />
+              <IconButton
+                variant="primary"
+                type="submit"
+                isDisabled={sendDisabled}
+                label={copy.steerLabel}
+                aria-busy={sendPending ? 'true' : undefined}
+                data-pending={sendPending ? 'true' : undefined}
+                tooltip={copy.steerLabel}
+                icon={<ArrowUp size={16} aria-hidden="true" />}
+              />
+            </div>
+          ) : props.streaming ? (
             <UiButton
               variant="primary"
               isDisabled={props.stopPending}
@@ -1571,6 +1775,20 @@ export const Composer = forwardRef<
           )}
         />
       </form>
+      {attachmentLightbox && (
+        <Lightbox
+          // Driven by the flag, never by unmounting: the component must
+          // survive the close so Astryx runs dialog.close(), which is what
+          // hands focus back to the chip button that opened it (the native
+          // <dialog> contract keyboard users rely on).
+          isOpen={attachmentLightboxOpen}
+          onOpenChange={(isOpen) => {
+            if (!isOpen) setAttachmentLightboxOpen(false);
+          }}
+          hasZoom
+          media={attachmentLightbox}
+        />
+      )}
     </>
   );
 });

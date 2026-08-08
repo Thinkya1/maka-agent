@@ -28,7 +28,9 @@ import { registerAppIpc } from "./app-ipc-main.js";
 import { createAppQuitCoordinator } from "./app-quit-coordinator.js";
 import { createAppUpdateService } from "./app-update-service.js";
 import { createAttachmentApprovalRegistry } from "./attachment-approval.js";
-import { resizeImageForAttachment } from "./attachment-resize-native.js";
+import { renderAttachmentPreview, resizeImageForAttachment } from "./attachment-resize-native.js";
+import { registerAttachmentPreviewIpc } from "./attachment-preview.js";
+import { readFileCapped } from "./attachment-ingest.js";
 import { registerBrowserIpc } from "./browser-ipc-main.js";
 import { releaseBrowserSession } from "./browser/session.js";
 import { resolveBuildInfo } from "./build-info.js";
@@ -43,6 +45,7 @@ import { registerOnboardingIpc } from "./onboarding-ipc-main.js";
 import { registerNotificationsIpc } from "./notifications-ipc-main.js";
 import { registerPlanReminderIpc } from "./plan-reminders-ipc-main.js";
 import { createPlanReminderMainService } from "./plan-reminders-main.js";
+import { registerPetPackIpc } from "./pet-pack-import.js";
 import {
   createPermissionOverlayMain,
   registerPermissionOverlayIpc,
@@ -50,6 +53,7 @@ import {
 import { resolveProjectContextRoot } from "./project-context-root.js";
 import { createProjectManagementService } from "./project-management-service.js";
 import { createProjectRootController } from "./project-root-controller.js";
+import { createSessionCopyCleanupAuthority } from "./quote-companion-cleanup.js";
 import {
   projectHostConnections,
   registerRuntimeHostConnectionsIpc,
@@ -82,7 +86,6 @@ import {
 import { registerRuntimeHostSkillsIpc } from "./runtime-host-skills-ipc-main.js";
 import { hasRuntimeHostInterruptibleWork } from "./runtime-host-update-activity.js";
 import { registerRuntimeHostUsageIpc } from "./runtime-host-usage-ipc-main.js";
-import { registerRuntimeHostVoiceIpc } from "./runtime-host-voice-ipc-main.js";
 import { registerRuntimeHostWebSearchIpc } from "./runtime-host-web-search-ipc-main.js";
 import { resolveShellEnv } from "./shell-env.js";
 import {
@@ -194,7 +197,6 @@ const updateMockState =
 const updateService = createAppUpdateService({
   currentVersion: app.getVersion(),
   isPackaged: app.isPackaged,
-  openExternal: (url) => shell.openExternal(url),
   mockLatestVersion: process.env.MAKA_UPDATE_MOCK_VERSION,
   mockState: updateMockState,
   onStatusChange: (status) =>
@@ -237,6 +239,7 @@ mcpManager.onChange(() => {
 });
 
 registerPersistentClientIpc();
+registerPetPackIpc({ ipcMain, workspaceRoot, mainWindowController, settingsStore });
 registerBrowserIpc({ mainWindowController });
 registerNotificationsIpc({
   ipcMain,
@@ -282,6 +285,8 @@ owner = await startRuntimeHostDesktopOwner(
     emitModeChanged: (sessionId) =>
       emitSessionsChanged("mode-change", sessionId),
     completeComputerUseTurn,
+    createSessionCopyCleanup: ({ removeSession }) =>
+      createSessionCopyCleanupAuthority({ workspaceRoot, removeSession }),
     sendToRenderer: (channel, payload) =>
       mainWindowController.send(channel, payload),
     onError: (error) =>
@@ -450,7 +455,6 @@ function registerHostClientIpc(
       mainWindowController.send(channel, ...args),
   });
   registerRuntimeHostWebSearchIpc({ ipcMain: scopedIpc, client });
-  registerRuntimeHostVoiceIpc({ ipcMain: scopedIpc, client, settingsStore });
   registerPlanReminderIpc({
     ipcMain: scopedIpc,
     planReminders,
@@ -566,6 +570,12 @@ function registerPersistentClientIpc(): void {
       ok: true,
       files: attachmentApprovals.issueApprovals(event.sender.id, chosen),
     };
+  });
+  registerAttachmentPreviewIpc({
+    ipcMain,
+    approvals: attachmentApprovals,
+    readFile: readFileCapped,
+    renderPreview: renderAttachmentPreview,
   });
 }
 

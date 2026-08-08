@@ -18,19 +18,18 @@ import type {
 } from '@maka/core';
 import {
   collapseSessionRevisions,
-  filterLinkedSessionTree,
-  hasSettledInitialOnboarding,
   isLinkedSubagentSession,
   parseGraphCommand,
   parseSwarmCommand,
-  projectRevisionLinkedSessionTree,
   resolveUiLocale,
 } from '@maka/core';
+import { hasSettledInitialOnboarding } from '@maka/core/onboarding-milestone';
 import {
   AutomationsPage,
   DailyReviewPage,
   ChatSurfaceLayout,
   type ComposerHandle,
+  type ComposerSlashCommandOption,
   type MakaUriDest,
   MakaUriContext,
   AstryxLocaleProvider,
@@ -41,15 +40,18 @@ import {
   SessionListPanel,
   SkillsPage,
   type SessionViewMode,
+  TitlebarSessionIdentity,
   type TurnFooterActionMeta,
   type WorkspacePickerModel,
   useToast,
   activeInteractionFor,
+  deriveTitlebarProjectName,
   enqueueInteraction,
   getConversationCopy,
   getSharedUiCopy,
   reconcileInteractions,
 } from '@maka/ui';
+import { MessageCircleQuestion } from '@maka/ui/icons';
 import { useKeyboardHelp } from './keyboard-help';
 import { useCommandPalette } from './command-palette';
 import { ChatMessageSurface } from './chat-message-surface';
@@ -58,12 +60,29 @@ import { useAppShellSessionUiReads } from './use-app-shell-session-ui-reads';
 import { AgentGraphPanel } from './agent-graph-panel';
 import { ChatComposerRegion } from './chat-composer-region';
 import { ChatWorkbar } from './chat-workbar';
+import type {
+  SessionWorkbarPlacement,
+  SessionWorkbarTab,
+  SessionWorkbarTabKind,
+} from './session-workbar-tabs';
 import {
+  findPreferredSideChatWorkbarTab,
+  terminalRefFromWorkbarTab,
+  terminalSessionWorkbarTabId,
+  staticSessionWorkbarTabId,
+} from './session-workbar-tabs';
+import {
+  consumeCompanionInitialPrompt,
   consumeCompanionQuoteSnapshot,
+  openCompanionPanel,
   removeStagedCompanionQuote,
   stageCompanionQuote,
   type QuoteCompanionPanelState,
 } from './quote-companion-panel-state';
+import {
+  parseSideChatCommand,
+  sideChatTitleFromPrompt,
+} from './side-chat-command';
 import {
   applyCompanionForkVisibilityEvent,
   reconcileCompanionForkVisibility,
@@ -84,12 +103,18 @@ import { ProviderLogo } from './settings/provider-display';
 import { ProviderBrandMark } from './settings/provider-brand-marks';
 import { getShellCopy, localizedShellErrorMessage } from './locales/shell-copy';
 import { getDesktopConversationCopy } from './locales/conversation-copy';
+import {
+  SideChatCloseConfirmation,
+  SKIP_SIDE_CHAT_CLOSE_CONFIRMATION_KEY,
+} from './side-chat-close-confirmation';
+import { safeLocalStorageGet, safeLocalStorageSet } from './browser-storage';
 import { ErrorBoundary } from './error-boundary';
 import { useShellAppearance } from './use-shell-appearance';
 import { useShellSearch } from './use-shell-search';
 import { useSessionGoal } from './use-session-goal';
 import { deriveStaleSessionIds } from './stale-sessions';
 import { deriveProjectGroups, deriveWorktreeSessionIds } from './session-project-grouping';
+import { deriveSessionRail } from './session-rail';
 import { useAppShellTurnPresentation } from './app-shell-turn-view-model';
 import { readScrollMotionBehavior } from './scroll-motion-policy';
 import { deriveBranchBanner } from './branch-banner';
@@ -105,8 +130,11 @@ import {
 import { modelSetupToastCopy } from './model-connection-errors';
 import type { AppShellCommandListOptions } from './app-shell-command-actions';
 import { AppShellTopbarActions, AppShellWorkspaceTopActions } from './app-shell-chrome-actions';
+import { updateReminderFromStatus } from './app-shell-app-update';
 import { AppShellDetailPanel } from './app-shell-detail-panel';
 import { AppShellOverlays } from './app-shell-overlays';
+import { CustomPetCompanion } from './custom-pet-companion';
+import { derivePetActivityState } from './custom-pet-companion-model';
 import { createAppShellDailyReviewBridge } from './app-shell-daily-review-bridge';
 import { useAppShellModuleData } from './use-module-data';
 import { useKeepSystemAwake } from './use-keep-system-awake';
@@ -119,6 +147,8 @@ import {
 } from './app-shell-chat-actions';
 import { createAppShellTurnActions } from './app-shell-turn-actions';
 import {
+  abandonTurnRevisionCopyAttempt,
+  completeTurnRevisionCopyAttempt,
   createAppShellRevisionActions,
   type TurnRevisionDraft,
 } from './app-shell-revision-actions';
@@ -128,7 +158,6 @@ import { createAppShellSessionRowActions } from './app-shell-session-row-actions
 import { createAppShellSessionSettingsActions } from './app-shell-session-settings-actions';
 import { createAppShellStopAction } from './app-shell-stop-action';
 import { useStableActions } from './use-stable-actions';
-import { useVoiceInput } from './use-voice-input';
 import {
   useActiveSessionEvents,
   useAppShellBootstrapSubscriptions,
@@ -151,6 +180,7 @@ import { useShellChatModel } from './use-shell-chat-model';
 import { useShellLiveTurn } from './use-shell-live-turn';
 import { useShellLayout } from './use-shell-layout';
 import { useShellResume } from './use-shell-resume';
+import { filterUserVisibleArtifacts } from './artifact-visibility';
 
 function rebaseWorkspaceFileReferences(
   sourceText: string,
@@ -225,6 +255,30 @@ export function AppShell({ initialOnboardingSnapshot = null }: AppShellProps = {
         </ToastProvider>
       </AstryxLocaleProvider>
     </LocaleProvider>
+  );
+}
+
+function nextSideChatOrdinal(tabs: readonly SessionWorkbarTab[]): number {
+  return (
+    tabs.reduce(
+      (highest, tab, index) =>
+        tab.kind === 'side-chat'
+          ? Math.max(highest, tab.ordinal ?? index + 1)
+          : highest,
+      0,
+    ) + 1
+  );
+}
+
+function nextTerminalOrdinal(tabs: readonly SessionWorkbarTab[]): number {
+  return (
+    tabs.reduce(
+      (highest, tab, index) =>
+        tab.kind === 'terminal'
+          ? Math.max(highest, tab.ordinal ?? index + 1)
+          : highest,
+      0,
+    ) + 1
   );
 }
 
@@ -304,9 +358,10 @@ function AppShellContent({
   const [newChatSwarmModeActive, setNewChatSwarmModeActive] = useState(false);
   const [newChatGraphModeActive, setNewChatGraphModeActive] = useState(false);
   const [pendingOrchestrationModeBySession, setPendingOrchestrationModeBySession] = useState<Record<string, boolean>>({});
+  const [petCompletionNonce, setPetCompletionNonce] = useState(0);
   // P3: session ids with a live embedded-browser view. The right-side
   // BrowserPanel mounts only for these, so ordinary chats reserve no space.
-  const [liveBrowserSessionIds, setLiveBrowserSessionIds] = useState<string[]>([]);
+  const [, setLiveBrowserSessionIds] = useState<string[]>([]);
   const [navigationState, setNavigationState] = useState(() => readNavigationState());
   const navSelection = navigationState.selection;
   const setNavSelection = useCallback<Dispatch<SetStateAction<NavSelection>>>((nextSelection) => {
@@ -335,7 +390,6 @@ function AppShellContent({
   const { memoryActive, refreshMemoryActive } = useShellMemoryPill({ toastApi, uiLocale });
   const {
     connections,
-    connectionsRevision,
     defaultConnection,
     setConnections,
     setDefaultConnection,
@@ -372,8 +426,8 @@ function AppShellContent({
     userLabel,
     setUserLabel,
     defaultPermissionMode,
+    defaultThinkingLevel,
     setDefaultPermissionMode,
-    voiceCaptureConfigured,
     refreshShellSettings,
   } = useShellAppearance({
     toastApi,
@@ -382,7 +436,9 @@ function AppShellContent({
     setUiLocalePreference,
   });
   const shellCopy = getShellCopy(uiLocale).app;
-  const voiceCopy = getDesktopConversationCopy(uiLocale).voice;
+  const desktopConversationCopy = getDesktopConversationCopy(uiLocale);
+  const terminalPanelCopy = desktopConversationCopy.terminalPanel;
+  const workbarCopy = desktopConversationCopy.workbar;
   useEffect(() => {
     if (!isAppUpdateInstallFailure(appUpdateStatus)) {
       notifiedInstallErrorRef.current = null;
@@ -414,19 +470,13 @@ function AppShellContent({
     };
   }, []);
 
-  const updateReminder =
-    appUpdateStatus?.state === 'available' ||
-    appUpdateStatus?.state === 'downloading' ||
-    appUpdateStatus?.state === 'downloaded' ||
-    (appUpdateStatus?.state === 'error' && Boolean(appUpdateStatus.latestVersion))
-    ? {
-        state: appUpdateStatus.state,
-        latestVersion: appUpdateStatus.latestVersion ?? appUpdateStatus.currentVersion,
-        progressPercent: appUpdateStatus.state === 'downloading' ? appUpdateStatus.progress.percent : undefined,
-      }
-    : undefined;
+  const updateReminder = updateReminderFromStatus(appUpdateStatus);
+  // Dispatches on the reminder, not on the raw status: the footer is this
+  // callback's only caller and it only renders for the two states above, so
+  // reading the status again here would be the same "who needs the user" list
+  // maintained twice.
   const openUpdateDownload = useCallback(() => {
-    if (appUpdateStatus?.state === 'downloaded') {
+    if (updateReminder?.state === 'downloaded') {
       if (updateInstallInFlightRef.current) return;
       updateInstallInFlightRef.current = true;
       void requestDownloadedAppUpdate({
@@ -458,44 +508,23 @@ function AppShellContent({
         });
       return;
     }
-    if (
-      appUpdateStatus?.state === 'available' ||
-      appUpdateStatus?.state === 'downloading' ||
-      appUpdateStatus?.state === 'error'
-    ) {
-      void window.maka.app
-        .retryUpdateDownload()
-        .then((next) => {
-          if (next.state !== 'error') return;
-          toastApi.error(
-            shellCopy.updateRetryFailedTitle,
-            shellCopy.updateRetryFailedFallback,
-          );
-        })
-        .catch((error) => {
-          toastApi.error(
-            shellCopy.updateRetryFailedTitle,
-            localizedShellErrorMessage(error, shellCopy.updateRetryFailedFallback, uiLocale),
-          );
-        });
-      return;
-    }
+    if (!updateReminder) return;
     void window.maka.app
-      .openUpdateDownload()
-      .then((result) => {
-        if (result.ok) return;
+      .retryUpdateDownload()
+      .then((next) => {
+        if (next.state !== 'error') return;
         toastApi.error(
-          shellCopy.updateOpenFailedTitle,
-          shellCopy.updateOpenManualFallback,
+          shellCopy.updateRetryFailedTitle,
+          shellCopy.updateRetryFailedFallback,
         );
       })
       .catch((error) => {
         toastApi.error(
-          shellCopy.updateOpenFailedTitle,
-          localizedShellErrorMessage(error, shellCopy.tryAgainLater, uiLocale),
+          shellCopy.updateRetryFailedTitle,
+          localizedShellErrorMessage(error, shellCopy.updateRetryFailedFallback, uiLocale),
         );
       });
-  }, [appUpdateStatus, shellCopy, toastApi, uiLocale]);
+  }, [updateReminder, shellCopy, toastApi, uiLocale]);
   const moduleHubCopy = getSharedUiCopy(uiLocale).moduleHubs;
   const extensionsHubHeader = {
     title: moduleHubCopy.extensions.title,
@@ -531,12 +560,24 @@ function AppShellContent({
   // boolean — see the prop's note on SessionListPanel. The sidenav is mounted
   // for the whole shell, so the handle is always live by the time it is called.
   const sessionSideNavHandleRef = useRef<SideNavImperativeCollapseHandle | null>(null);
-  // Codex-style quote side panel: a companion (fork of the main session) opened
-  // from text selections in the transcript, surfaced as a transient workbar tab.
-  // `quotes` accumulates excerpts staged for the next follow-up — selecting more
-  // text adds to the SAME panel rather than opening a new one; `sourceSessionId`
-  // pins it to the main session the companion forks from.
-  const [quotePanel, setQuotePanel] = useState<QuoteCompanionPanelState | null>(null);
+  // Codex-style side conversations: each workbar tab owns a separate transient
+  // read-only fork, composer draft, quote queue, and cleanup lifecycle.
+  const [quotePanels, setQuotePanels] = useState<QuoteCompanionPanelState[]>([]);
+  const [sideChatContentPanelIds, setSideChatContentPanelIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [sideChatPreparingPanelIds, setSideChatPreparingPanelIds] =
+    useState<ReadonlySet<string>>(() => new Set());
+  const [sideChatActivePanelIds, setSideChatActivePanelIds] =
+    useState<ReadonlySet<string>>(() => new Set());
+  const [pendingSideChatClose, setPendingSideChatClose] =
+    useState<Array<{ placement: SessionWorkbarPlacement; tab: SessionWorkbarTab }>>(
+      [],
+    );
+  const [skipSideChatCloseConfirmation, setSkipSideChatCloseConfirmation] =
+    useState(
+      () => safeLocalStorageGet(SKIP_SIDE_CHAT_CLOSE_CONFIRMATION_KEY) === 'true',
+    );
   // Created companion forks stay hidden until authoritative cleanup succeeds or
   // a later authoritative session list confirms they are gone. A set preserves
   // earlier failed cleanups when another companion opens.
@@ -572,6 +613,8 @@ function AppShellContent({
     if (draft.sourceSessionId !== draft.draftSessionId) {
       composerRef.current?.clearDraft(draft.sourceSessionId);
     }
+    if (draft.copyPhase === 'reserved') completeTurnRevisionCopyAttempt(draft);
+    else void abandonTurnRevisionCopyAttempt(draft);
     commitRevisionDraft(null);
   }, [sessions, commitRevisionDraft]);
 
@@ -601,22 +644,22 @@ function AppShellContent({
   // Running → Waiting → Blocked → Active → Review → Done → Archived);
   // `aborted` is dropped. Pinned (flagged) sessions float to the top
   // in their own group, preserving the PR48 pin-floats behavior.
-  const sidebarSessionTree = useMemo(
-    () => projectRevisionLinkedSessionTree(sessions, activeId),
-    [sessions, activeId],
-  );
-  const visibleSessionTree = useMemo(
+  // One projection owns rail membership, active highlight, and titlebar parent:
+  // revision-tree roots (orphans stay; linked children with a live parent leave),
+  // flat nav / companion filter — never promote children past ancestors.
+  const {
+    sessions: visibleSessions,
+    activeRowId: sidebarActiveId,
+    activeParentSession: railParentSession,
+  } = useMemo(
     () =>
-      // Exclude the quote companion's ephemeral fork so it stays hidden from the
-      // main session list while its panel is open.
-      filterLinkedSessionTree(sidebarSessionTree, (session) =>
+      deriveSessionRail(sessions, activeId, (session) =>
         !hiddenCompanionForkIds.has(session.id)
           ? sessionMatchesNavSelection(session, navSelection)
           : false,
       ),
-    [sidebarSessionTree, navSelection, hiddenCompanionForkIds],
+    [sessions, activeId, navSelection, hiddenCompanionForkIds],
   );
-  const visibleSessions = visibleSessionTree.roots;
   // PR-DAILY-REVIEW-MVP-0: bridge for the main Daily Review module.
   // Memoized so the panel's `useEffect` cleanup keys
   // off a stable reference instead of refetching on every render.
@@ -644,19 +687,26 @@ function AppShellContent({
     hasInFlightLiveTools,
     hasLiveTurnContent,
     turnActive,
+    showRunningStatus,
     showProcessingIndicator,
     showContinuingIndicator,
   } = useShellLiveTurn({
     liveTurn: activeLiveTurnSnapshot,
     activeSession,
   });
+  const petActivityState = derivePetActivityState({
+    hasActiveSession: activeSession !== undefined,
+    hasActiveInteraction: activeInteraction !== undefined,
+    turnActive,
+    sessionStatus: activeSession?.status,
+  });
   // Surface a credential-lifecycle alert directly in the chat header when
   // the active session's connection is in `needs_reauth` / `error` or has
-  // been deleted entirely with no usable default. We skip the async hasSecret
-  // fetch here — the composer-adjacent notice is a hard-block surface;
-  // AccountSettingsPage remains the authoritative detailed view. Model /
-  // thinking selection + the hard-only health notice live in useShellChatModel
-  // (pure derivation of the connection list + active session);
+  // been deleted entirely with no usable default. Main resolves credential
+  // presence into the onboarding snapshot; a connection event starts an async
+  // snapshot pull, so the notice keeps the previous outcome only until that
+  // pull completes. Model / thinking selection + the hard-only health notice
+  // live in useShellChatModel (pure derivation of the snapshot + active session);
   // openSettingsSection is injected so the notice can wrap the derived click
   // target.
   const {
@@ -678,15 +728,15 @@ function AppShellContent({
   } = useShellChatModel({
     uiLocale,
     connections,
-    connectionsRevision,
+    snapshotChoices: onboarding.snapshot?.chatModelChoices,
+    sessionSendOutcome: activeSession
+      ? onboarding.snapshot?.sessionSendOutcomes[activeSession.id]
+      : undefined,
     defaultConnection,
     activationCandidate: onboardingActivationCandidate,
     activeSession,
-    // Only trust the loaded transcript once the active session's
-    // messages finished loading; during the load the list may still be
-    // empty or carry the previous session.
-    activeSessionHasUserMessage: !messageLoadPending && messages.some((message) => message.type === 'user'),
     persistedComposerDefaults,
+    defaultThinkingLevel,
     openSettingsSection,
   });
   const newChatProviderType = newChatModel
@@ -1050,6 +1100,16 @@ function AppShellContent({
     openSessionInChat(parentSessionId);
   }
 
+  // Same revision-aware parent row the rail uses — not a second physical-id walk.
+  const titlebarParentSession = useMemo(() => {
+    if (!railParentSession) return undefined;
+    const parentId = railParentSession.id;
+    return {
+      name: railParentSession.name,
+      onOpen: () => openSessionInChatRef.current(parentId),
+    };
+  }, [railParentSession]);
+
   const activeSessionForView: SessionSummary | undefined =
     activeSession ??
     (activeId
@@ -1216,20 +1276,409 @@ function AppShellContent({
     setSessionListCollapsed,
     workbarCollapsed,
     setWorkbarCollapsed,
+    bottomPanelOpen,
+    setBottomPanelOpen,
     workbarWidth,
     workbarResizable,
-    workbarTab,
-    setWorkbarTab,
+    bottomPanelHeight,
+    bottomPanelResizable,
+    workbarPanelsState,
+    openWorkbarTab,
+    openDynamicWorkbarTab,
+    activateWorkbarTab,
+    closeWorkbarTab,
+    closeWorkbarTabs,
+    reorderWorkbarTab,
+    moveWorkbarTab,
+    moveWorkbarTabToPanel,
+    titleWorkbarTab,
+    pinWorkbarTab,
+    openWorkbarLauncher,
   } = useShellLayout();
+  const workbarPanelsStateRef = useRef(workbarPanelsState);
+  workbarPanelsStateRef.current = workbarPanelsState;
 
-  // The companion panel unmounts (and its fork is removed) when the workbar
-  // collapses or the active session moves off the panel's source; clear the
-  // stale panel state too, so returning doesn't reopen a blank companion tab.
+  const revealWorkbarLauncher = useCallback(() => {
+    setWorkbarCollapsed(false);
+    openWorkbarLauncher('right');
+  }, [openWorkbarLauncher, setWorkbarCollapsed]);
+
+  const openSideConversation = useCallback((initialPrompt?: string) => {
+    const sourceSessionId = activeIdRef.current;
+    if (!sourceSessionId) return;
+    const panel = openCompanionPanel(null, {
+      sourceSessionId,
+      initialPrompt,
+      newId: () => crypto.randomUUID(),
+    });
+    setQuotePanels((current) => [...current, panel]);
+    setSideChatPreparingPanelIds((current) => new Set(current).add(panel.id));
+    openDynamicWorkbarTab({
+      id: `side-chat:${panel.id}`,
+      kind: 'side-chat',
+      title: sideChatTitleFromPrompt(initialPrompt ?? ''),
+      ordinal: nextSideChatOrdinal([
+        ...workbarPanelsState.right.tabs,
+        ...workbarPanelsState.bottom.tabs,
+      ]),
+    });
+    setWorkbarCollapsed(false);
+  }, [
+    openDynamicWorkbarTab,
+    setWorkbarCollapsed,
+    workbarPanelsState,
+  ]);
+  const openSideConversationRef = useRef(openSideConversation);
+  openSideConversationRef.current = openSideConversation;
+  const sideChatSlashCommands = useMemo<
+    readonly ComposerSlashCommandOption[]
+  >(
+    () =>
+      activeId
+        ? [
+            {
+              id: 'side',
+              name: workbarCopy.sideChat,
+              description: workbarCopy.launcher.sideChat,
+              keywords: ['side', 'btw', '侧聊', '追问'],
+              Icon: MessageCircleQuestion,
+              onSelect: () => openSideConversationRef.current(),
+            },
+          ]
+        : [],
+    [activeId, workbarCopy],
+  );
   useEffect(() => {
-    if (quotePanel && (workbarCollapsed || quotePanel.sourceSessionId !== activeId)) {
-      setQuotePanel(null);
+    return window.maka.artifacts.subscribeChanges((event) => {
+      if (
+        event.reason !== 'created' ||
+        event.sessionId !== activeIdRef.current ||
+        navSelectionRef.current.section !== 'sessions'
+      ) {
+        return;
+      }
+      const expectedSessionId = event.sessionId;
+      void window.maka.artifacts
+        .get(expectedSessionId, event.artifactId)
+        .then((artifact) => {
+          if (
+            !artifact ||
+            activeIdRef.current !== expectedSessionId ||
+            navSelectionRef.current.section !== 'sessions' ||
+            filterUserVisibleArtifacts([artifact]).length === 0
+          ) {
+            return;
+          }
+          const filesTabId = staticSessionWorkbarTabId('files');
+          const current = workbarPanelsStateRef.current;
+          const placement = current.right.tabs.some(
+            (tab) => tab.id === filesTabId,
+          )
+            ? 'right'
+            : current.bottom.tabs.some((tab) => tab.id === filesTabId)
+              ? 'bottom'
+              : 'right';
+          openDynamicWorkbarTab(
+            {
+              id: filesTabId,
+              kind: 'files',
+              preview: true,
+            },
+            placement,
+          );
+          if (placement === 'right') setWorkbarCollapsed(false);
+          else setBottomPanelOpen(true);
+        })
+        .catch(() => {});
+    });
+  }, [
+    openDynamicWorkbarTab,
+    setBottomPanelOpen,
+    setWorkbarCollapsed,
+  ]);
+
+  const openSideConversationWithQuote = useCallback(
+    (quote: QuoteRef) => {
+      if (!activeId) return;
+      const activeSideChat = findPreferredSideChatWorkbarTab(workbarPanelsState);
+      const activeSideChatTab = activeSideChat?.tab;
+      const activePanelId = activeSideChatTab?.id.slice('side-chat:'.length);
+      const activePanel = quotePanels.find(
+        (panel) =>
+          panel.id === activePanelId && panel.sourceSessionId === activeId,
+      );
+      const panel = stageCompanionQuote(
+        activePanel ?? null,
+        {
+          sourceSessionId: activeId,
+          quote,
+          newId: () => crypto.randomUUID(),
+        },
+      );
+      setQuotePanels((current) =>
+        activePanel
+          ? current.map((candidate) => (candidate.id === panel.id ? panel : candidate))
+          : [...current, panel],
+      );
+      if (!activePanel) {
+        setSideChatPreparingPanelIds((current) => new Set(current).add(panel.id));
+      }
+      const targetPlacement =
+        activeSideChat?.placement ?? 'right';
+      openDynamicWorkbarTab(
+        {
+          id: `side-chat:${panel.id}`,
+          kind: 'side-chat',
+          ordinal:
+            activeSideChatTab?.ordinal ??
+            nextSideChatOrdinal([
+              ...workbarPanelsState.right.tabs,
+              ...workbarPanelsState.bottom.tabs,
+            ]),
+        },
+        targetPlacement,
+      );
+      if (targetPlacement === 'right') setWorkbarCollapsed(false);
+      else setBottomPanelOpen(true);
+    },
+    [
+      activeId,
+      openDynamicWorkbarTab,
+      quotePanels,
+      setBottomPanelOpen,
+      setWorkbarCollapsed,
+      workbarPanelsState,
+    ],
+  );
+
+  const requestOpenWorkbarTab = useCallback(
+    (placement: SessionWorkbarPlacement, kind: SessionWorkbarTabKind) => {
+      if (kind === 'terminal') {
+        if (!activeId) return;
+        const ownerSessionId = activeId;
+        const tabs = [
+          ...workbarPanelsState.right.tabs,
+          ...workbarPanelsState.bottom.tabs,
+        ];
+        void window.maka.shellRuns
+          .start(ownerSessionId)
+          .then((update) => {
+            const ref = update.result.ref;
+            openDynamicWorkbarTab(
+              {
+                id: terminalSessionWorkbarTabId(ref),
+                kind: 'terminal',
+                ordinal: nextTerminalOrdinal(tabs),
+                resourceRef: ref,
+                ownerSessionId,
+              },
+              placement,
+            );
+            if (placement === 'right') setWorkbarCollapsed(false);
+            else setBottomPanelOpen(true);
+          })
+          .catch((error) => {
+            toastApi.error(
+              terminalPanelCopy.startFailed,
+              localizedShellErrorMessage(
+                error,
+                terminalPanelCopy.startFailed,
+                uiLocale,
+              ),
+            );
+          });
+        return;
+      }
+      if (kind === 'side-chat') {
+        if (!activeId) return;
+        const panel = openCompanionPanel(null, {
+          sourceSessionId: activeId,
+          newId: () => crypto.randomUUID(),
+        });
+        setQuotePanels((current) => [...current, panel]);
+        setSideChatPreparingPanelIds((current) => new Set(current).add(panel.id));
+        openDynamicWorkbarTab(
+          {
+            id: `side-chat:${panel.id}`,
+            kind: 'side-chat',
+            ordinal: nextSideChatOrdinal([
+              ...workbarPanelsState.right.tabs,
+              ...workbarPanelsState.bottom.tabs,
+            ]),
+          },
+          placement,
+        );
+        if (placement === 'right') setWorkbarCollapsed(false);
+        else setBottomPanelOpen(true);
+        return;
+      }
+      openWorkbarTab(kind, placement);
+      if (placement === 'right') setWorkbarCollapsed(false);
+      else setBottomPanelOpen(true);
+    },
+    [
+      activeId,
+      openDynamicWorkbarTab,
+      openWorkbarTab,
+      setBottomPanelOpen,
+      setWorkbarCollapsed,
+      terminalPanelCopy,
+      toastApi,
+      uiLocale,
+      workbarPanelsState,
+    ],
+  );
+
+  const closeWorkbarTabsImmediately = useCallback(
+    (
+      placement: SessionWorkbarPlacement,
+      tabs: readonly SessionWorkbarTab[],
+    ) => {
+      if (tabs.length === 0) return;
+      for (const tab of tabs) {
+        const ref = terminalRefFromWorkbarTab(tab);
+        if (!ref || !tab.ownerSessionId) continue;
+        void window.maka.shellRuns
+          .stop({ sessionId: tab.ownerSessionId, ref })
+          .catch(() => {});
+      }
+      closeWorkbarTabs(placement, tabs.map((tab) => tab.id));
+      const panelIds = new Set(
+        tabs
+          .filter((tab) => tab.kind === 'side-chat')
+          .map((tab) => tab.id.slice('side-chat:'.length)),
+      );
+      if (panelIds.size === 0) return;
+      setQuotePanels((current) =>
+        current.filter((panel) => !panelIds.has(panel.id)),
+      );
+      setSideChatContentPanelIds((current) => {
+        const next = new Set(
+          [...current].filter((panelId) => !panelIds.has(panelId)),
+        );
+        return next.size === current.size ? current : next;
+      });
+      setSideChatPreparingPanelIds((current) => {
+        const next = new Set(
+          [...current].filter((panelId) => !panelIds.has(panelId)),
+        );
+        return next.size === current.size ? current : next;
+      });
+      setSideChatActivePanelIds((current) => {
+        const next = new Set(
+          [...current].filter((panelId) => !panelIds.has(panelId)),
+        );
+        return next.size === current.size ? current : next;
+      });
+    },
+    [closeWorkbarTabs],
+  );
+
+  useEffect(() => {
+    const stale = (['right', 'bottom'] as const).flatMap((placement) =>
+      workbarPanelsState[placement].tabs
+        .filter(
+          (tab) =>
+            tab.kind === 'terminal' &&
+            tab.ownerSessionId !== activeId,
+        )
+        .map((tab) => ({ placement, tab })),
+    );
+    for (const placement of ['right', 'bottom'] as const) {
+      const tabs = stale
+        .filter((candidate) => candidate.placement === placement)
+        .map((candidate) => candidate.tab);
+      closeWorkbarTabsImmediately(placement, tabs);
     }
-  }, [quotePanel, workbarCollapsed, activeId]);
+  }, [activeId, closeWorkbarTabsImmediately, workbarPanelsState]);
+
+  const closeWorkbarTabsAndSurfaces = useCallback(
+    (
+      placement: SessionWorkbarPlacement,
+      tabs: readonly SessionWorkbarTab[],
+    ) => {
+      const closableTabs = tabs.filter(
+        (tab) =>
+          tab.kind !== 'side-chat' ||
+          !sideChatPreparingPanelIds.has(tab.id.slice('side-chat:'.length)),
+      );
+      if (closableTabs.length === 0) return;
+      const needsConfirmation =
+        !skipSideChatCloseConfirmation &&
+        closableTabs.some(
+          (tab) =>
+            tab.kind === 'side-chat' &&
+            sideChatContentPanelIds.has(tab.id.slice('side-chat:'.length)),
+        );
+      if (needsConfirmation) {
+        setPendingSideChatClose(
+          closableTabs.map((tab) => ({ placement, tab })),
+        );
+        return;
+      }
+      closeWorkbarTabsImmediately(placement, closableTabs);
+    },
+    [
+      closeWorkbarTabsImmediately,
+      sideChatContentPanelIds,
+      sideChatPreparingPanelIds,
+      skipSideChatCloseConfirmation,
+    ],
+  );
+
+  const closeWorkbarTabAndSurface = useCallback(
+    (placement: SessionWorkbarPlacement, tab: SessionWorkbarTab) =>
+      closeWorkbarTabsAndSurfaces(placement, [tab]),
+    [closeWorkbarTabsAndSurfaces],
+  );
+
+  const toggleWorkbar = useCallback(() => {
+    if (workbarCollapsed) {
+      setWorkbarCollapsed(false);
+      if (workbarPanelsState.right.tabs.length === 0) {
+        openWorkbarLauncher('right');
+      }
+      return;
+    }
+    setWorkbarCollapsed(true);
+  }, [
+    openWorkbarLauncher,
+    setWorkbarCollapsed,
+    workbarCollapsed,
+    workbarPanelsState.right.tabs.length,
+  ]);
+
+  // Side chats survive a panel collapse. They are cleaned up only when their
+  // tab closes or when navigation leaves the owning source session.
+  useEffect(() => {
+    const stalePanels = quotePanels.filter(
+      (panel) => panel.sourceSessionId !== activeId,
+    );
+    if (stalePanels.length === 0) return;
+    const staleIds = new Set(stalePanels.map((panel) => panel.id));
+    for (const panel of stalePanels) {
+      const tabId = `side-chat:${panel.id}`;
+      const placement = workbarPanelsState.right.tabs.some((tab) => tab.id === tabId)
+        ? 'right'
+        : 'bottom';
+      closeWorkbarTab(placement, tabId);
+    }
+    setQuotePanels((current) =>
+      current.filter((panel) => !staleIds.has(panel.id)),
+    );
+    setSideChatContentPanelIds((current) => {
+      const next = new Set([...current].filter((panelId) => !staleIds.has(panelId)));
+      return next.size === current.size ? current : next;
+    });
+    setSideChatPreparingPanelIds((current) => {
+      const next = new Set([...current].filter((panelId) => !staleIds.has(panelId)));
+      return next.size === current.size ? current : next;
+    });
+    setSideChatActivePanelIds((current) => {
+      const next = new Set([...current].filter((panelId) => !staleIds.has(panelId)));
+      return next.size === current.size ? current : next;
+    });
+  }, [quotePanels, activeId, closeWorkbarTab, workbarPanelsState]);
 
   function isAutomationsSurfaceActive(): boolean {
     return navSelectionRef.current.section === 'automations' && navSelectionRef.current.module === 'plan-reminders';
@@ -1338,6 +1787,13 @@ function AppShellContent({
     },
     onSelectNoProject: selectNoProject,
   };
+  // The titlebar names the directory the ACTIVE session runs in, so it reads
+  // the same projected project state the picker does — `projectInfo` already
+  // resolves to the session's own cwd once a session owns it.
+  const titlebarProjectName = deriveTitlebarProjectName({
+    projectName: currentProject?.name,
+    projectPath: projectInfo?.projectPath,
+  });
   const sessionProjectGroups = useMemo(
     () => deriveProjectGroups(visibleSessions, projects, uiLocale),
     [visibleSessions, projects, uiLocale],
@@ -1395,7 +1851,7 @@ function AppShellContent({
     setSearchModalOpen,
     setSessionListCollapsed,
     setWorkbarCollapsed,
-    setWorkbarTab,
+    openWorkbarTab,
     setThemePref,
     setUiLocaleOverride,
   });
@@ -1440,131 +1896,6 @@ function AppShellContent({
     newChatProjectId: selectedProjectId,
   });
 
-  const voiceInput = useVoiceInput({
-    getDraftKey: () => activeIdRef.current ?? 'new-session',
-    getCurrentAgent: () => {
-      if (activeIdRef.current && activeSessionForView) {
-        return {
-          connectionSlug: activeSessionForView.llmConnectionSlug,
-          model: activeSessionForView.model,
-        };
-      }
-      return newChatModel
-        ? {
-            connectionSlug: newChatModel.llmConnectionSlug,
-            model: newChatModel.model,
-          }
-        : undefined;
-    },
-    appendTranscript: (draftKey, text) => {
-      composerRef.current?.appendDraft?.(draftKey, text);
-    },
-    sendNativeVoice: (operationId) =>
-      send(
-        'Listen to the attached audio and carry out the user request. The audio is authoritative.',
-        undefined,
-        {
-          voiceOperationId: operationId,
-          displayText: voiceCopy.taskDisplayText,
-        },
-      ),
-    runCoordinatorTool: async (call, context) => {
-      if (call.name === 'start_task') {
-        if (!call.arguments.task) throw new Error('voice_task_missing');
-        let taskSessionId: string | undefined;
-        const ok = await send(call.arguments.task, undefined, {
-          onSessionResolved: (sessionId) => {
-            taskSessionId = sessionId;
-          },
-        });
-        return {
-          output: {
-            ok,
-            ...(taskSessionId ? { sessionId: taskSessionId } : {}),
-          },
-          ...(ok && taskSessionId ? { taskSessionId } : {}),
-        };
-      }
-      const sessionId = context.taskSessionId;
-      if (!sessionId) {
-        return { output: { ok: false, status: 'no_active_task' } };
-      }
-      if (call.name === 'steer_task') {
-        if (!call.arguments.guidance) throw new Error('voice_guidance_missing');
-        const outcome = await window.maka.sessions.steer(
-          sessionId,
-          call.arguments.guidance,
-        );
-        if (outcome.kind === 'fallback') {
-          const sendResult = await window.maka.sessions.send(sessionId, {
-            type: 'send',
-            turnId: crypto.randomUUID(),
-            text: call.arguments.guidance,
-          });
-          await refreshSessions();
-          if (activeIdRef.current === sessionId) {
-            await refreshMessages(sessionId);
-          }
-          return {
-            output: { ok: sendResult.ok, fallback: true, sessionId },
-            taskSessionId: sessionId,
-          };
-        }
-        return {
-          output: { ok: true, queued: true, sessionId },
-          taskSessionId: sessionId,
-        };
-      }
-      if (call.name === 'check_task') {
-        const authoritativeSessions = await refreshSessions();
-        const session = authoritativeSessions.find((candidate) => candidate.id === sessionId);
-        return {
-          output: session
-            ? { ok: true, sessionId: session.id, status: session.status }
-            : { ok: false, sessionId, status: 'task_not_found' },
-          ...(session ? { taskSessionId: sessionId } : {}),
-        };
-      }
-      const taskMessages = await window.maka.sessions.readMessages(sessionId);
-      const lastAssistant = [...taskMessages]
-        .reverse()
-        .find((message) => message.type === 'assistant');
-      return {
-        output: {
-          ok: true,
-          sessionId,
-          summary:
-            lastAssistant?.type === 'assistant'
-              ? lastAssistant.text.slice(-4_000)
-              : voiceCopy.noTaskResponse,
-        },
-        taskSessionId: sessionId,
-      };
-    },
-    onBlocked: (reason) => {
-      const configure =
-        reason === 'recognition_not_configured' ||
-        reason === 'realtime_not_configured';
-      toastApi.error(
-        voiceCopy.unavailableTitle,
-        configure
-          ? voiceCopy.configureDescription
-          : reason,
-      );
-      if (configure) openSettingsSection('voice');
-    },
-    onError: (error) => {
-      toastApi.error(
-        voiceCopy.operationFailedTitle,
-        localizedShellErrorMessage(
-          error,
-          voiceCopy.operationFailedFallback,
-          uiLocale,
-        ),
-      );
-    },
-  });
-
   const { handleTurnFooterAction } = useStableActions(createAppShellTurnActions, {
     uiLocale,
     activeIdRef,
@@ -1607,6 +1938,7 @@ function AppShellContent({
     const revisionSend = Boolean(
       revision && activeIdRef.current === revision.draftSessionId,
     );
+    const sideChatCommand = parseSideChatCommand(text);
     const swarmCommand = parseSwarmCommand(text);
     const graphCommand = parseGraphCommand(text);
     if (
@@ -1625,7 +1957,7 @@ function AppShellContent({
         toastApi.info(actionCopy.revisionUnavailableTitle, actionCopy.revisionAttachmentsUnsupported);
         return false;
       }
-      if (text.trim() === '/compact' || swarmCommand || graphCommand) {
+      if (text.trim() === '/compact' || sideChatCommand || swarmCommand || graphCommand) {
         toastApi.info(actionCopy.revisionUnavailableTitle, actionCopy.revisionCommandUnsupported);
         return false;
       }
@@ -1649,6 +1981,28 @@ function AppShellContent({
         }
         return false;
       }
+    }
+    if (sideChatCommand) {
+      if (!activeIdRef.current) {
+        toastApi.info(
+          shellCopy.sideChatUnavailableTitle,
+          shellCopy.sideChatUnavailableDescription,
+        );
+        return false;
+      }
+      if (
+        pendingAttachments.length > 0 ||
+        pendingQuotes.length > 0 ||
+        (metadata?.workspaceFileReferences?.length ?? 0) > 0
+      ) {
+        toastApi.info(
+          shellCopy.sideChatContextPendingTitle,
+          shellCopy.sideChatContextPendingDescription,
+        );
+        return false;
+      }
+      openSideConversation(sideChatCommand.prompt || undefined);
+      return true;
     }
     if (swarmCommand) {
       if (swarmCommand.kind === 'status') {
@@ -1749,6 +2103,7 @@ function AppShellContent({
     if (ok !== false && quotes) clearQuotes();
     if (ok !== false && revisionSend) {
       if (expectedRevisionDraft) {
+        completeTurnRevisionCopyAttempt(expectedRevisionDraft);
         composerRef.current?.clearDraft(expectedRevisionDraft.draftSessionId);
         if (expectedRevisionDraft.sourceSessionId !== expectedRevisionDraft.draftSessionId) {
           composerRef.current?.clearDraft(expectedRevisionDraft.sourceSessionId);
@@ -1757,6 +2112,24 @@ function AppShellContent({
       commitRevisionDraft(null);
     }
     return ok;
+  }
+
+  async function steerWithText(text: string): Promise<boolean> {
+    const sessionId = activeIdRef.current;
+    if (!sessionId || !text.trim()) return false;
+    try {
+      const outcome = await window.maka.sessions.steer(sessionId, text.trim());
+      return outcome.kind === 'queued';
+    } catch (error) {
+      if (activeIdRef.current === sessionId) {
+        const copy = getDesktopConversationCopy(uiLocale).actions;
+        toastApi.error(
+          copy.operationFailedTitle,
+          localizedShellErrorMessage(error, copy.operationFailedFallback, uiLocale),
+        );
+      }
+      return false;
+    }
   }
 
   const stop = createAppShellStopAction({
@@ -1782,6 +2155,9 @@ function AppShellContent({
     showModelSetupToast,
     toastApi,
     notifyRunEnded: ({ kind, sessionId, body }) => {
+      if (kind === 'completed' && activeIdRef.current === sessionId) {
+        setPetCompletionNonce((current) => current + 1);
+      }
       const title = sessionsRef.current.find((session) => session.id === sessionId)?.name;
       // Best-effort: swallow any main-side failure so a missed banner
       // never surfaces as an unhandled promise rejection.
@@ -1806,6 +2182,45 @@ function AppShellContent({
   }, [activeId, activeStreamingMessageId, messages, settleAssistantStreaming]);
 
   const hasModalOpen = helpOpen || paletteOpen || searchModalOpen;
+
+  useEffect(() => {
+    const handleWorkbarShortcut = (event: KeyboardEvent) => {
+      if (
+        hasModalOpen ||
+        navSelectionRef.current.section !== 'sessions' ||
+        !activeId
+      ) {
+        return;
+      }
+      const primary = navigator.platform.toLowerCase().includes('mac')
+        ? event.metaKey
+        : event.ctrlKey;
+      const key = event.key.toLowerCase();
+      if (event.ctrlKey && event.shiftKey && !event.altKey && key === 'g') {
+        event.preventDefault();
+        requestOpenWorkbarTab('right', 'review');
+      } else if (
+        event.ctrlKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        (key === '`' || event.code === 'Backquote')
+      ) {
+        event.preventDefault();
+        requestOpenWorkbarTab('right', 'terminal');
+      } else if (primary && !event.altKey && !event.shiftKey && key === 't') {
+        event.preventDefault();
+        requestOpenWorkbarTab('right', 'browser');
+      } else if (primary && !event.altKey && !event.shiftKey && key === 'p') {
+        event.preventDefault();
+        requestOpenWorkbarTab('right', 'files');
+      } else if (primary && event.altKey && !event.shiftKey && key === 's') {
+        event.preventDefault();
+        requestOpenWorkbarTab('right', 'side-chat');
+      }
+    };
+    window.addEventListener('keydown', handleWorkbarShortcut, true);
+    return () => window.removeEventListener('keydown', handleWorkbarShortcut, true);
+  }, [activeId, hasModalOpen, requestOpenWorkbarTab]);
 
   useAppShellNavRefSync({
     navSelection,
@@ -1858,7 +2273,9 @@ function AppShellContent({
     sessionListWidth,
     workbarCollapsed,
     workbarWidth,
-    workbarTab,
+    bottomPanelOpen,
+    bottomPanelHeight,
+    workbarPanelsState,
     themePalette,
     themePref,
   });
@@ -2006,9 +2423,8 @@ function AppShellContent({
     // agentReadEnabled switch.
     void refreshMemoryActive();
     // Settings pages own optimistic local drafts, so the shell does not see
-    // every write live. Refresh its display mirrors on close: permission mode
-    // and the independently configured voice routes must both update without
-    // requiring an app restart.
+    // every write live. Refresh its display mirrors on close (e.g. default
+    // permission mode) without requiring an app restart.
     void refreshShellSettings();
   }
 
@@ -2054,6 +2470,7 @@ function AppShellContent({
     openPlanReminderForm,
     openProjectFolder,
     openSessionInChat,
+    openSideConversation,
     openSettings,
     openSettingsSection,
     openSkillsFolder,
@@ -2086,6 +2503,23 @@ function AppShellContent({
          readers at all — and three writers of the same value is three chances
          for them to disagree. */
       data-sidebar-state={sessionListCollapsed ? 'collapsed' : 'expanded'}
+      /* Published here for the same reason `data-sidebar-state` is: the frame is
+         the only ancestor shared by the sidebar column and the titlebar strip,
+         and both need this number. The column is this wide; the titlebar's
+         session breadcrumb opens at that edge rather than straddling the seam
+         between the columns.
+
+         Only the EXPANDED width, and only as an inline style, because that is
+         the half of the answer this component owns — the user's dragged width.
+         The collapsed width is a constant, so shell-layout.css states it off
+         `data-sidebar-state`. Writing both here would duplicate the constant;
+         writing this one unconditionally would bury the other, since an inline
+         custom property outranks any rule that redefines it. */
+      style={
+        sessionListCollapsed
+          ? undefined
+          : ({ '--maka-sidenav-width': `${sessionListWidth}px` } as CSSProperties)
+      }
     >
       <LiveTurnReconciler
         controller={sessionUiController}
@@ -2108,11 +2542,41 @@ function AppShellContent({
           sidebarToggleHidden={settingsOpen}
           onOpenSearchModal={() => setSearchModalOpen(true)}
         />
+        {/* Only a session has an identity to state. The other views name
+            themselves in the nav column they are selected from, and the
+            new-task surface still shows its project in the composer's
+            WorkspacePicker — which stops rendering at the exact moment this
+            takes over, when the first message creates the session. */}
+        {/* `activeSessionForView`, not `activeSession`: opening or creating a
+            session runs a few hundred ms on a placeholder record while the real
+            summary loads, and the name this replaced (the context layer's) was
+            showing through that window. Hung on the real record alone, 新任务
+            was named nowhere for the length of it. */}
+        {navSelection.section === 'sessions' && activeSessionForView && (
+          <TitlebarSessionIdentity
+            /* Keyed by session: the open rename is local state and the field is
+               uncontrolled, so a switch that left the instance mounted would
+               carry one session's half-typed name — and its commit — onto the
+               next one. A remount ties the edit to the session it belongs to. */
+            key={activeSessionForView.id}
+            sessionName={activeSessionForView.name}
+            onRenameSession={(name) => {
+              void sessionRowActionHandlers.renameSession(activeSessionForView.id, name);
+            }}
+            project={
+              titlebarProjectName
+                ? { name: titlebarProjectName, onOpenFolder: () => void openProjectFolder() }
+                : undefined
+            }
+            parentSession={titlebarParentSession}
+          />
+        )}
         {!VIEWS_WITHOUT_WORKSPACE_ACTIONS.has(agentsView) && (
           <AppShellWorkspaceTopActions
             workbarAvailable={navSelection.section === 'sessions' && Boolean(activeId)}
             workbarCollapsed={workbarCollapsed}
-            onToggleWorkbar={() => setWorkbarCollapsed((current) => !current)}
+            onOpenWorkbarLauncher={revealWorkbarLauncher}
+            onToggleWorkbar={toggleWorkbar}
           />
         )}
       </header>
@@ -2141,14 +2605,13 @@ function AppShellContent({
             maxWidth={SESSION_LIST_EXPANDED_MAX_WIDTH}
             selection={navSelection}
             sessions={visibleSessions}
-            activeId={activeId}
+            activeId={sidebarActiveId}
             planReminders={planReminders}
             streamingSessionIds={streamingSessionIds}
             staleSessionIds={staleSessionIds}
             viewMode={viewMode}
             onViewModeChange={setViewMode}
             groups={viewMode === 'project' ? sessionProjectGroups : undefined}
-            childSessionsByParentId={visibleSessionTree.childrenByParentId}
             worktreeSessionIds={worktreeSessionIds}
             moduleMemory={navigationState.moduleMemory}
             onSelect={setNavSelection}
@@ -2291,17 +2754,8 @@ function AppShellContent({
                   // "Maka 继续中…". Both are mutually exclusive with activeStreamingLive.
                   processing={showProcessingIndicator && !activeStreamingLive}
                   continuing={showContinuingIndicator && !activeStreamingLive}
-                  voiceCaptureState={voiceInput.captureState}
-                  realtimeVoiceState={voiceInput.realtimeState}
-                  voiceProviderLabel={voiceInput.providerLabel}
-                  onToggleVoiceCapture={
-                    voiceCaptureConfigured ? voiceInput.toggleCapture : undefined
-                  }
-                  onCancelVoiceCapture={
-                    voiceCaptureConfigured ? voiceInput.cancelCapture : undefined
-                  }
-                  onToggleRealtimeVoice={voiceInput.toggleRealtime}
                   onSend={sendWithAttachments}
+                  onSteer={steerWithText}
                   onStop={stop}
                   revisionNotice={
                     revisionDraft && activeId === revisionDraft.draftSessionId
@@ -2314,6 +2768,7 @@ function AppShellContent({
                       : undefined
                   }
                   mentionSkills={mentionSkills}
+                  slashCommands={sideChatSlashCommands}
                   onSearchMentionFiles={searchMentionFiles}
                   pendingAttachments={pendingAttachments}
                   onRemoveAttachment={removeAttachment}
@@ -2440,8 +2895,7 @@ function AppShellContent({
                 activeSessionId={activeId}
                 messages={messages}
                 messageLoading={activeMessageLoading}
-                processingIndicator={showProcessingIndicator}
-                continuingIndicator={showContinuingIndicator}
+                runningStatus={showRunningStatus}
                     onStreamingSettled={
                       activeId ? (messageId) => settleAssistantStreaming(activeId, messageId) : undefined
                     }
@@ -2491,6 +2945,7 @@ function AppShellContent({
                 } : undefined}
                 onLineageBadgeClick={handleLineageBadgeClick}
                 onReadAttachmentBytes={window.maka.attachments.readBytes}
+                onOpenLinkedSession={openSessionInChat}
                 scrollTargetTurn={
                   activeId && searchScrollTarget?.sessionId === activeId
                         ? {
@@ -2515,21 +2970,9 @@ function AppShellContent({
                     ? (input) => {
                         const quote: QuoteRef = {
                           text: input.text,
-                          ...(input.turnId ? { sourceTurnId: input.turnId } : {}),
+                          sourceTurnId: input.turnId,
                         };
-                        // Accumulate onto the open panel for this session rather
-                        // than spawning a new one; otherwise start a fresh panel.
-                        setQuotePanel((prev) =>
-                          stageCompanionQuote(prev, {
-                            sourceSessionId: activeId,
-                            quote,
-                            newId: () => crypto.randomUUID(),
-                          }),
-                        );
-                        // Surface it inside the session workbar (as a tab) rather
-                        // than a second right column — open the bar on the quote tab.
-                        setWorkbarCollapsed(false);
-                        setWorkbarTab('quote');
+                        openSideConversationWithQuote(quote);
                       }
                     : undefined
                 }
@@ -2579,33 +3022,142 @@ function AppShellContent({
             {navSelection.section === 'sessions' && activeId && (
               <ChatWorkbar
                 activeId={activeId}
-                collapsed={workbarCollapsed}
-                browserLive={liveBrowserSessionIds.includes(activeId)}
+                rightCollapsed={workbarCollapsed}
+                bottomOpen={bottomPanelOpen}
                 hidden={hasModalOpen}
-                width={workbarWidth}
-                onDismiss={() => setWorkbarCollapsed(true)}
-                activeTab={workbarTab}
-                onActiveTabChange={setWorkbarTab}
-                workbarResizable={workbarResizable}
-                quote={
-                  quotePanel && quotePanel.sourceSessionId === activeId ? quotePanel : null
-                }
-                onClearQuote={() => setQuotePanel(null)}
+                rightWidth={workbarWidth}
+                bottomHeight={bottomPanelHeight}
+                onDismissPanel={(placement) => {
+                  if (placement === 'right') setWorkbarCollapsed(true);
+                  else setBottomPanelOpen(false);
+                }}
+                panelsState={workbarPanelsState}
+                onActivateTab={activateWorkbarTab}
+                onCloseTab={closeWorkbarTabAndSurface}
+                onCloseTabs={closeWorkbarTabsAndSurfaces}
+                onReorderTab={reorderWorkbarTab}
+                onMoveTab={moveWorkbarTab}
+                onMoveTabToPanel={moveWorkbarTabToPanel}
+                onPinTab={pinWorkbarTab}
+                onOpenLauncher={(placement) => {
+                  openWorkbarLauncher(placement);
+                  if (placement === 'right') setWorkbarCollapsed(false);
+                  else setBottomPanelOpen(true);
+                }}
+                onRequestOpenTab={requestOpenWorkbarTab}
+                rightResizable={workbarResizable}
+                bottomResizable={bottomPanelResizable}
+                quotes={quotePanels.filter(
+                  (panel) => panel.sourceSessionId === activeId,
+                )}
                 onQuotesConsumed={(snapshot) =>
-                  setQuotePanel((prev) => consumeCompanionQuoteSnapshot(prev, snapshot))
+                  setQuotePanels((current) =>
+                    current.map((panel) =>
+                      panel.id === snapshot.panelId
+                        ? consumeCompanionQuoteSnapshot(panel, snapshot) ?? panel
+                        : panel,
+                    ),
+                  )
                 }
                 onRemoveQuote={(target) =>
-                  setQuotePanel((prev) => removeStagedCompanionQuote(prev, target))
+                  setQuotePanels((current) =>
+                    current.map((panel) =>
+                      panel.id === target.panelId
+                        ? removeStagedCompanionQuote(panel, target) ?? panel
+                        : panel,
+                    ),
+                  )
                 }
                 onForkVisibilityChange={onCompanionForkVisibilityChange}
+                onContentStateChange={(panelId, hasContent) =>
+                  setSideChatContentPanelIds((current) => {
+                    if (current.has(panelId) === hasContent) return current;
+                    const next = new Set(current);
+                    if (hasContent) next.add(panelId);
+                    else next.delete(panelId);
+                    return next;
+                  })
+                }
+                preparingSideChatPanelIds={sideChatPreparingPanelIds}
+                activeSideChatPanelIds={sideChatActivePanelIds}
+                onPreparingStateChange={(panelId, preparing) =>
+                  setSideChatPreparingPanelIds((current) => {
+                    if (current.has(panelId) === preparing) return current;
+                    const next = new Set(current);
+                    if (preparing) next.add(panelId);
+                    else next.delete(panelId);
+                    return next;
+                  })
+                }
+                onInitialPromptStarted={(panelId) =>
+                  setQuotePanels((current) =>
+                    current.map((panel) =>
+                      panel.id === panelId
+                        ? consumeCompanionInitialPrompt(panel, panelId) ?? panel
+                        : panel,
+                    ),
+                  )
+                }
+                onPromptAccepted={(panelId, prompt) => {
+                  const title = sideChatTitleFromPrompt(prompt);
+                  if (title) {
+                    titleWorkbarTab(`side-chat:${panelId}`, title);
+                  }
+                }}
+                onActivityStateChange={(panelId, active) =>
+                  setSideChatActivePanelIds((current) => {
+                    if (current.has(panelId) === active) return current;
+                    const next = new Set(current);
+                    if (active) next.add(panelId);
+                    else next.delete(panelId);
+                    return next;
+                  })
+                }
                 sourceSession={activeSessionForView}
                 modelChoices={chatModelChoices}
+                mentionSkills={mentionSkills}
+                onSearchMentionFiles={searchMentionFiles}
               />
             )}
           </div>
           </MakaUriContext.Provider>
         </AppShellDetailPanel>
       </AstryxAppShell>
+      {!hasModalOpen && !settingsOpen && (
+        <CustomPetCompanion
+          activityState={petActivityState}
+          completionNonce={petCompletionNonce}
+          contextKey={activeId}
+        />
+      )}
+      <SideChatCloseConfirmation
+        key={pendingSideChatClose.map(({ tab }) => tab.id).join(':') || 'closed'}
+        open={pendingSideChatClose.length > 0}
+        sideChatCount={
+          pendingSideChatClose.filter(({ tab }) => tab.kind === 'side-chat').length
+        }
+        onCancel={() => setPendingSideChatClose([])}
+        onConfirm={(skipFutureConfirmations) => {
+          const pending = pendingSideChatClose;
+          if (pending.length === 0) return;
+          if (skipFutureConfirmations) {
+            setSkipSideChatCloseConfirmation(true);
+            safeLocalStorageSet(SKIP_SIDE_CHAT_CLOSE_CONFIRMATION_KEY, 'true');
+          }
+          setPendingSideChatClose([]);
+          const byPlacement = {
+            right: pending
+              .filter(({ placement }) => placement === 'right')
+              .map(({ tab }) => tab),
+            bottom: pending
+              .filter(({ placement }) => placement === 'bottom')
+              .map(({ tab }) => tab),
+          };
+          closeWorkbarTabsImmediately('right', byPlacement.right);
+          closeWorkbarTabsImmediately('bottom', byPlacement.bottom);
+        }}
+      />
+
       <AppShellOverlays
         settingsOpen={settingsOpen}
         connections={connections}

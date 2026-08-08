@@ -6,6 +6,7 @@
   "type": "module",
   "private": true,
   "exports": {
+    "./adapter": "./dist/adapter/index.js",
     "./protocol": "./dist/protocol/index.js",
     "./client": "./dist/client/index.js",
     "./execution-candidate-main": "./dist/execution-candidate-main.js",
@@ -24,6 +25,6 @@
     "@maka/storage": "0.1.0"
   },
   "devDependencies": {
-    "electron": "^43.1.1"
+    "electron": "^43.2.0"
   }
 }

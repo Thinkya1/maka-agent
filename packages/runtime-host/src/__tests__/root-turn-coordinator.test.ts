@@ -32,7 +32,6 @@ import type {
   BackendSendInput,
 } from '@maka/core/backend-types';
 import type { SessionEvent } from '@maka/core/events';
-import { VOICE_INPUT_MARKER, type EphemeralVoiceAudio } from '@maka/core/voice';
 import type { MakaTool } from '@maka/runtime';
 import {
   openInteractiveExecutionStoresForWrite,
@@ -476,120 +475,65 @@ test('turn.start resolves explicit Skills once before durable admission and repl
   }
 });
 
-test('turn.start transfers Host-owned native audio into one runtime execution', async () => {
-  const recordingBackends: VoiceRecordingBackend[] = [];
-  let consumeCount = 0;
-  const audio: EphemeralVoiceAudio = {
-    bytes: new Uint8Array([82, 73, 70, 70]),
-    mediaType: 'audio/wav',
-    format: 'wav',
-    durationMs: 500,
-    sampleRate: 16_000,
-    channels: 1,
-    retention: 'operation_memory',
-  };
+test('idle turn.message.submit applies hosted Skill preparation before durable admission', async () => {
+  let preparationCount = 0;
   const fixture = await createFailureFixture({
-    registerBackend: (backends) =>
-      backends.register('fake', (context) => {
-        const backend = new VoiceRecordingBackend(context.sessionId);
-        recordingBackends.push(backend);
-        return backend;
-      }),
-    voice: {
-      consumeNativeAudio: (input) => {
-        consumeCount += 1;
-        assert.equal(input.connectionSlug, 'fake');
-        assert.equal(input.model, 'fake-model');
-        assert.equal(input.ownerConnectionId, 'voice-client');
-        return audio;
-      },
+    registerBackend: (backends) => backends.register('fake', (context) => new FakeBackend(context)),
+    prepareSkillInvocation: async (): Promise<PreparedSkillInvocationMessage> => {
+      preparationCount += 1;
+      return {
+        disposition: 'ready',
+        sendText: '<invoked-skill>Write clearly.</invoked-skill>\n\nDraft this.',
+        skillInvocation: {
+          loaded: [{ id: 'writer', name: 'Writer' }],
+          failed: [],
+          receipts: [
+            {
+              invocation: 'explicit',
+              request: 'writer',
+              success: true,
+              ref: 'project:maka:writer',
+              id: 'writer',
+              name: 'Writer',
+              scope: 'project',
+              source: 'maka',
+              truncated: false,
+            },
+          ],
+        },
+      };
     },
   });
   try {
-    const started = await fixture.coordinator.handlers['turn.start'](
+    const outcome = await fixture.messages.handlers['turn.message.submit'](
       {
+        originHostEpoch: fixture.hostEpoch,
         sessionId: fixture.sessionId,
-        turnId: 'turn-hosted-voice',
-        content: { text: '' },
-        voiceOperationId: '123e4567-e89b-12d3-a456-426614174000',
+        messageId: 'idle-skill-message',
+        content: { text: '/skill:writer Draft this.' },
+        placement: 'current_turn',
       },
-      operationContext(fixture.hostEpoch, fixture.acquireResidency, 'voice-client'),
+      operationContext(fixture.hostEpoch, fixture.acquireResidency),
     );
-    assert.equal(started.ok, true, JSON.stringify(started));
-    assert.equal(consumeCount, 1);
-    await waitUntil(() => recordingBackends.some((backend) => backend.voiceAudio !== undefined));
-    assert.deepEqual(recordingBackends.find((backend) => backend.voiceAudio)?.voiceAudio, audio);
-    const userMessage = (await fixture.stores.sessionStore.readMessages(fixture.sessionId)).find(
-      (message) => message.type === 'user',
+    assert.equal(outcome.ok, true, JSON.stringify(outcome));
+    assert.equal(preparationCount, 1);
+    if (!outcome.ok || outcome.result.disposition !== 'turn_started') return;
+    const admission = await fixture.stores.agentRunStore.readRootTurnAdmission(
+      fixture.sessionId,
+      outcome.result.turnId,
     );
-    assert.equal(userMessage?.text, '[Voice input]');
-  } finally {
-    await fixture.dispose();
-  }
-});
-
-test('startup recovery fails a Voice admission whose ephemeral audio cannot survive restart', async () => {
-  const fixture = await createFailureFixture({
-    registerBackend: (backends) => backends.register('fake', (context) => new FakeBackend(context)),
-  });
-  const turnId = 'turn-hosted-voice-recovery';
-  const runId = 'run-hosted-voice-recovery';
-  let recovery: RootTurnCoordinator | undefined;
-  try {
-    const admitted = await fixture.stores.agentRunStore.admitRootTurn({
-      sessionId: fixture.sessionId,
-      turnId,
-      proposedRunId: runId,
-      proposedUserMessageId: 'message-hosted-voice-recovery',
-      execution: {
-        kind: 'external_message',
-        inputDigest: `sha256:${'0'.repeat(64)}`,
-        ephemeralInput: 'voice',
-      },
-      previousRootTurnId: null,
-      normalizedInput: { text: VOICE_INPUT_MARKER },
-      sourceMessages: [],
-      admittedAt: Date.now(),
+    assert.deepEqual(admission?.normalizedInput, {
+      text: '<invoked-skill>Write clearly.</invoked-skill>\n\nDraft this.',
+      displayText: '/skill:writer Draft this.',
+      inlineReferences: [{ kind: 'skill', value: '/skill:writer', label: 'Writer', start: 0 }],
     });
-    assert.equal(admitted.kind, 'admitted');
-
-    recovery = fixture.createRecoveryCoordinator();
-    await recovery.prepareRecovery();
-    await recovery.recover();
-
-    const run = await fixture.stores.agentRunStore.readRun(fixture.sessionId, runId);
-    assert.equal(run.status, 'failed');
-    assert.equal(run.failureClass, 'app_restarted');
-    const terminal = (
-      await fixture.stores.runtimeEventStore.readRuntimeEvents(fixture.sessionId, runId)
-    ).find((event) => event.status === 'failed');
-    assert.deepEqual(terminal?.actions?.stateDelta, {
-      recovered: true,
-      recoveryReason: 'ephemeral_voice_admission_without_run',
-      executionKind: 'external_message',
-      ephemeralInput: 'voice',
-      failureClass: 'app_restarted',
-    });
-  } finally {
-    await recovery?.close();
-    await fixture.dispose();
-  }
-});
-
-test('a literal Voice marker remains an ordinary text message', async () => {
-  const fixture = await createFailureFixture({
-    registerBackend: (backends) => backends.register('fake', (context) => new FakeBackend(context)),
-  });
-  try {
-    const started = await fixture.coordinator.handlers['turn.start'](
-      {
-        sessionId: fixture.sessionId,
-        turnId: 'turn-literal-voice-marker',
-        content: { text: VOICE_INPUT_MARKER },
-      },
-      operationContext(fixture.hostEpoch, fixture.acquireResidency, 'text-client'),
+    assert.deepEqual(admission?.sourceMessages[0]?.content, admission?.normalizedInput);
+    assert.match(
+      admission?.execution.kind === 'external_message'
+        ? (admission.execution.inputDigest ?? '')
+        : '',
+      /^sha256:[a-f0-9]{64}$/,
     );
-    assert.equal(started.ok, true);
   } finally {
     await fixture.dispose();
   }
@@ -1813,6 +1757,7 @@ test('hosted linked child roots share admission, message, terminal, and stop aut
         requireCoordinator(coordinator).claimStopFence(input, commitQueueFence, admission),
       startFromMessage: (input, admission) =>
         requireCoordinator(coordinator).startFromMessage(input, admission),
+      prepareMessage: (input) => requireCoordinator(coordinator).prepareMessage(input),
       claimStop: (input, commitQueueFence, admission) =>
         requireCoordinator(coordinator).claimStop(input, commitQueueFence, admission),
     };
@@ -4220,14 +4165,6 @@ async function createFailureFixture(options: {
     text: string;
     skillIds: readonly string[];
   }): Promise<PreparedSkillInvocationMessage>;
-  voice?: {
-    consumeNativeAudio(input: {
-      operationId: string;
-      connectionSlug: string;
-      model: string;
-      ownerConnectionId: string;
-    }): EphemeralVoiceAudio;
-  };
 }) {
   const base = await mkdtemp(join(tmpdir(), 'maka-root-turn-message-failure-'));
   const capability = await resolveStorageRoot({
@@ -4279,6 +4216,7 @@ async function createFailureFixture(options: {
       requireCoordinator(coordinator).claimStopFence(input, commitQueueFence, admission),
     startFromMessage: (input, admission) =>
       requireCoordinator(coordinator).startFromMessage(input, admission),
+    prepareMessage: (input) => requireCoordinator(coordinator).prepareMessage(input),
     claimStop: (input, commitQueueFence, admission) =>
       requireCoordinator(coordinator).claimStop(input, commitQueueFence, admission),
   };
@@ -4396,7 +4334,6 @@ async function createFailureFixture(options: {
       assertAutomationRecoveryAdmission,
       artifactAuthority,
       options.prepareSkillInvocation,
-      options.voice,
     );
   coordinator = createCoordinator(rootAdmissionOwner);
 
@@ -4516,30 +4453,6 @@ async function waitUntil(
     if (Date.now() >= deadline) throw new Error('Timed out waiting for test condition');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-}
-
-class VoiceRecordingBackend implements AgentBackend {
-  readonly kind = 'fake' as const;
-  voiceAudio: EphemeralVoiceAudio | undefined;
-
-  constructor(readonly sessionId: string) {}
-
-  async *send(input: BackendSendInput): AsyncIterable<SessionEvent> {
-    this.voiceAudio = input.voiceAudio;
-    yield {
-      type: 'complete',
-      id: randomUUID(),
-      turnId: input.turnId,
-      ts: Date.now(),
-      stopReason: 'end_turn',
-    };
-  }
-
-  async stop(): Promise<void> {}
-
-  async respondToSandboxBoundary(): Promise<void> {}
-
-  async dispose(): Promise<void> {}
 }
 
 class LinkedChildAuthorityBackend implements AgentBackend {

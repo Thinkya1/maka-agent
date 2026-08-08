@@ -4,7 +4,7 @@ import test from 'node:test';
 
 const PAGE = new URL('../../../src/renderer/settings/usage-settings-page.tsx', import.meta.url);
 const OVERLAYS = new URL('../../../src/renderer/app-shell-overlays.tsx', import.meta.url);
-const MODAL = new URL('../../../src/renderer/settings/SettingsModal.tsx', import.meta.url);
+const MODAL = new URL('../../../src/renderer/settings/settings-modal.tsx', import.meta.url);
 const SURFACE = new URL('../../../src/renderer/settings/settings-surface.tsx', import.meta.url);
 
 test('Pricing renderer stays behind the Host-backed port and away from the legacy bridge', async () => {

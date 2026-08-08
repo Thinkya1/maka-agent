@@ -47,19 +47,19 @@ import {
   listRunnableBuiltinAgentDefinitions,
   replayPlanItemsToModelMessages,
   recoverAgentGraphSupervisorContextOverflow,
+  renderAgentSwarmSupervisorWake,
   resolveSkillDiscoveryPaths,
   resolveSelectedModelContextWindow,
   projectEffectiveProductToolSurface,
   routeWebSearchTools,
+  shouldWakeAgentSwarmSupervisor,
   type AutomationDefinition,
   type EffectiveProductToolSurface,
-  type HostCapabilities,
   type HostCapabilitiesResolver,
   type MakaTool,
   type InvocationResult,
   type InvocationSource,
   type ShellRunUpdate,
-  type SkillSource,
   type ModelMessage,
 } from '@maka/runtime';
 import {
@@ -85,9 +85,9 @@ import { createAgentGraphControlStore } from '@maka/storage/agent-graph-control-
 import { resolveStorageRoot } from '@maka/storage/root-authority';
 import { resolveWorkspaceIdentity } from '@maka/storage/workspace-identity';
 import { fetchProviderModels } from '@maka/runtime';
-import { createApiKeyOnboardingSurface, type MakaOnboardingSurface } from './onboarding.js';
-import { isActiveShellRunStatus, resolveModelVisionSupport } from '@maka/core';
-import type { ModelChoice, ReadySessionTarget } from './connection-target.js';
+import { createApiKeyOnboardingSurface } from './onboarding.js';
+import { relayModelProfile, isActiveShellRunStatus, resolveModelVisionSupport } from '@maka/core';
+import type { ReadySessionTarget } from './connection-target.js';
 import {
   listReadyModelChoices,
   resolveDefaultSessionTarget,
@@ -95,6 +95,12 @@ import {
 } from './connection-target.js';
 import { buildCliSystemPrompt, buildCliTurnTailPrompt } from './cli-system-prompt.js';
 import { CliGoalContinuation } from './cli-goal-continuation.js';
+import type {
+  MakaCliSkillSurface,
+  MakaOnboardingSurface,
+  ModelChoice,
+  SessionRecapGenerator,
+} from './pi-tui-contracts.js';
 import { cleanRecapText } from './session-recap.js';
 
 export interface MakaCliRuntimeContext {
@@ -159,13 +165,6 @@ export function resolveCliStreamConnectTimeoutMs(
  * throws — failures resolve to `{ ok: false }` so callers can surface them
  * without a try/catch.
  */
-export interface SessionRecapGenerator {
-  generate(
-    sessionId: string,
-    reason: 'manual' | 'idle',
-  ): Promise<{ ok: true; text: string; raw: string } | { ok: false; error: string }>;
-}
-
 export interface CreateMakaCliRuntimeContextInput {
   surface: 'tui' | 'run' | 'activation';
   /** Legacy root; both new roots default to this path. */
@@ -202,13 +201,6 @@ export interface CreateMakaCliRuntimeContextInput {
 
 export interface GetOrCreateCliClaudeDeviceIdDeps {
   newId?: () => string;
-}
-
-export interface MakaCliSkillSurface {
-  /** Five-path discovery source for a session cwd (project-level paths are cwd-relative). */
-  source(cwd: string): SkillSource;
-  /** This host's capability surface — the same gate the Skill tool loads through. */
-  host: HostCapabilities;
 }
 
 export function isMakaClaudeSubscriptionCloakEnabled(
@@ -756,6 +748,7 @@ export async function createMakaCliRuntimeContext(
         ready.connection.providerType,
         ready.connection.models,
         ready.model,
+        relayModelProfile(ready.connection, ready.model)?.vision,
       ),
       readAttachmentBytes: createAttachmentByteReader({ artifactStore, sessionId: ctx.sessionId }),
       loadHistoryCompact: (event) => loadHistoryCompactBlocksFromArtifacts(artifactStore, event),
@@ -1000,6 +993,8 @@ export async function createMakaCliRuntimeContext(
           abortSignal,
           compactSession: (sessionId, input) => runtime.compactSession(sessionId, input),
         }),
+      shouldWake: shouldWakeAgentSwarmSupervisor,
+      renderWake: renderAgentSwarmSupervisorWake,
       newId: randomUUID,
       onDiagnostic: (diagnostic) => {
         console.warn('[agent-graph-supervisor-wake]', JSON.stringify(diagnostic));
@@ -1017,6 +1012,9 @@ export async function createMakaCliRuntimeContext(
       newId: randomUUID,
       onReconciliation: (rootSessionId, result) => {
         agentGraphSupervisorWakeCoordinator!.notify(rootSessionId, result);
+      },
+      onCheckpoint: (rootSessionId) => {
+        agentGraphSupervisorWakeCoordinator!.notify(rootSessionId);
       },
       onError: (rootSessionId, error) => {
         agentGraphErrors.set(rootSessionId, error);

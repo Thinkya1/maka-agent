@@ -37,6 +37,10 @@ import type {
   UsageRange,
   UsageStats,
   E2eFixtureState,
+  GitReviewReadResult,
+  GitReviewMutationAction,
+  GitReviewMutationResult,
+  GitReviewSource,
   ArtifactBinaryReadResult,
   ArtifactChangedEvent,
   ArtifactDescriptor,
@@ -58,12 +62,6 @@ import type {
   PlanReminderRecurrence,
   DailyReviewArchive,
   QueueEnqueueOutcome,
-  VoiceBeginRequest,
-  VoiceBeginResult,
-  VoiceCapturedAudio,
-  VoiceCoordinatorToolCall,
-  VoiceFinishCaptureResult,
-  VoiceRealtimeClientSession,
   DailyReviewArchiveSummary,
   DailyReviewConfig,
   DailyReviewRange,
@@ -78,6 +76,7 @@ import type {
   DeepResearchChangedEvent,
   DeepResearchClientProgress,
   LocalMemoryEntryPreview,
+  PetPackManifestV1,
 } from '@maka/core';
 import type { SessionTrace } from '@maka/core/session-trace';
 import type { TestProxyInput } from '@maka/core/settings/network-settings';
@@ -100,6 +99,8 @@ import type {
   AgentGraphClientSnapshotOptions,
   AgentGraphOperatorInspection,
   BotStatus,
+  ShellRunPtyDataEvent,
+  ShellRunPtySnapshot,
   WechatBridgeQrCodeResult,
 } from '@maka/runtime';
 import type { BundledSkillCatalogEntry, ManagedSkillSourceEntry, ManagedSkillUpdatePreview, SkillEntry, SkillGovernanceDetails } from '@maka/ui';
@@ -116,11 +117,23 @@ export interface OnboardingSnapshot {
   sessions: import('@maka/core').SessionSummary[];
   connections: import('@maka/core').LlmConnection[];
   defaultSlug: string | null;
+  chatModelChoices: import('@maka/core').ChatModelChoice[];
+  sessionSendOutcomes: Record<string, import('@maka/core').SessionSendProjection>;
 }
 
 export type RendererIngestInput =
   | { approvalId: string; name: string; mimeType?: string }
   | { file: File };
+
+export type DesktopBranchFromTurnInput = BranchFromTurnInput & {
+  /** Stable target identity for retrying one Desktop copy action. */
+  copyId: string;
+};
+
+export type DesktopReviseBeforeTurnInput = ReviseBeforeTurnInput & {
+  /** Stable target identity for retrying one Desktop copy action. */
+  copyId: string;
+};
 
 export type LocalMemoryMutationResult =
   | { ok: true; state: LocalMemoryState; entry?: LocalMemoryEntryPreview; proposal?: LocalMemoryEntryPreview }
@@ -156,9 +169,6 @@ export type AppUpdateStatus =
       state: 'available';
       currentVersion: string;
       latestVersion: string;
-      releaseName?: string;
-      releaseUrl?: string;
-      publishedAt?: string;
     }
   | {
       state: 'downloading';
@@ -175,8 +185,6 @@ export type AppUpdateStatus =
       state: 'downloaded';
       currentVersion: string;
       latestVersion: string;
-      releaseName?: string;
-      downloadedFile?: string;
     }
   | { state: 'installing'; currentVersion: string; latestVersion: string }
   | {
@@ -203,7 +211,51 @@ export type AppUpdateInstallResult =
  */
 export type WindowCommand = { id: 'newTask' | 'openSettings' | 'openHelp' };
 
+export interface PetPackChangedEvent {
+  readonly type: 'pet_pack_changed';
+  readonly reason: 'installed' | 'removed' | 'selected';
+  readonly petId: string | null;
+  readonly ts: number;
+}
+
 export interface MakaBridge {
+
+  pets: {
+    list(): Promise<PetPackManifestV1[]>;
+    getSelection(): Promise<string | null>;
+    select(petId: string | null): Promise<
+      | { ok: true; selectedPetId: string | null }
+      | {
+          ok: false;
+          reason: 'invalid_id' | 'not_found' | 'read_failed' | 'write_failed';
+        }
+    >;
+    readSpriteSheet(petId: string): Promise<
+      | { ok: true; mimeType: 'image/png' | 'image/webp'; bytes: Uint8Array }
+      | {
+          ok: false;
+          reason: 'invalid_id' | 'not_found' | 'corrupt_pack' | 'read_failed';
+        }
+    >;
+    remove(petId: string): Promise<
+      | { ok: true; removed: boolean }
+      | { ok: false; reason: 'invalid_id' | 'remove_failed' }
+    >;
+    importLocalDirectory(): Promise<
+      | { ok: true; manifest: PetPackManifestV1 }
+      | {
+          ok: false;
+          reason:
+            | 'cancelled'
+            | 'invalid_directory'
+            | 'invalid_manifest'
+            | 'invalid_asset'
+            | 'already_installed'
+            | 'read_failed';
+        }
+    >;
+    subscribeChanges(handler: (event: PetPackChangedEvent) => void): () => void;
+  };
 
   tasks: {
     list(sessionId: string): Promise<Task[]>;
@@ -240,7 +292,6 @@ export interface MakaBridge {
             turnId: string;
             text: string;
             displayText?: string;
-            voiceOperationId?: string;
             skillIds?: string[];
             attachmentItems?: RendererIngestInput[];
             turnOrchestration?: TurnOrchestration;
@@ -275,8 +326,8 @@ export interface MakaBridge {
       | { disposition: 'park'; rejectionReasons: string[]; diagnostics: unknown[] }
     >;
     regenerateTurn(sessionId: string, input: RegenerateTurnInput): Promise<void>;
-    branchFromTurn(sessionId: string, input: BranchFromTurnInput): Promise<SessionSummary>;
-    reviseBeforeTurn(sessionId: string, input: ReviseBeforeTurnInput): Promise<SessionSummary>;
+    branchFromTurn(sessionId: string, input: DesktopBranchFromTurnInput): Promise<SessionSummary>;
+    reviseBeforeTurn(sessionId: string, input: DesktopReviseBeforeTurnInput): Promise<SessionSummary>;
     respondToSandboxBoundary(sessionId: string, response: SandboxBoundaryResponse): Promise<void>;
     respondToUserQuestion(sessionId: string, response: UserQuestionResponse): Promise<void>;
     saveConversationToFile(input: {
@@ -315,7 +366,8 @@ export interface MakaBridge {
     setModel(sessionId: string, input: { llmConnectionSlug: string; model: string }): Promise<SessionSummary>;
     setThinkingLevel(sessionId: string, level: ThinkingLevel | undefined | null): Promise<SessionSummary>;
     remove(sessionId: string, options?: { revisionFamily?: boolean }): Promise<void>;
-    cleanupQuoteCompanion(sessionId: string): Promise<void>;
+    cleanupSessionCopy(sessionId: string): Promise<void>;
+    abandonSessionCopy(sessionId: string): Promise<void>;
   };
   projects: {
     list(): Promise<ProjectRecord[]>;
@@ -328,13 +380,45 @@ export interface MakaBridge {
     relink(
       projectId: string,
     ): Promise<{ ok: true; project: ProjectRecord } | { ok: false; reason: 'cancelled' }>;
+    /** Open a catalogued project's folder in the OS file manager. */
+    reveal(projectId: string): Promise<OpenPathResult>;
     rename(projectId: string, name: string): Promise<ProjectRecord>;
     archive(projectId: string): Promise<ProjectRecord>;
     restore(projectId: string): Promise<ProjectRecord>;
   };
   shellRuns: {
     list(sessionId: string): Promise<ShellRunUpdate[]>;
+    attach(input: {
+      sessionId: string;
+      ref: string;
+    }): Promise<ShellRunPtySnapshot | null>;
+    start(sessionId: string): Promise<ShellRunUpdate>;
+    write(input: {
+      sessionId: string;
+      ref: string;
+      input?: string;
+      size?: { cols: number; rows: number };
+    }): Promise<ShellRunUpdate | null>;
+    stop(input: {
+      sessionId: string;
+      ref: string;
+    }): Promise<ShellRunUpdate | null>;
     subscribeUpdates(handler: (update: ShellRunUpdate) => void): () => void;
+    subscribePtyData(handler: (event: ShellRunPtyDataEvent) => void): () => void;
+  };
+  gitReview: {
+    read(input: {
+      sessionId: string;
+      source: GitReviewSource;
+      baseBranch?: string;
+    }): Promise<GitReviewReadResult>;
+    mutate(input: {
+      sessionId: string;
+      source: Extract<GitReviewSource, 'unstaged' | 'staged'>;
+      revision: string;
+      path: string;
+      action: GitReviewMutationAction;
+    }): Promise<GitReviewMutationResult>;
   };
   goal: {
     /** The session's current goal (null when none is set). */
@@ -390,17 +474,6 @@ export interface MakaBridge {
         openInBrowser(sessionId: string): Promise<Result<void>>;
       };
     };
-  };
-  voice: {
-    begin(input: VoiceBeginRequest): Promise<VoiceBeginResult>;
-    finishCapture(
-      operationId: string,
-      audio: VoiceCapturedAudio,
-    ): Promise<VoiceFinishCaptureResult>;
-    cancel(operationId: string): Promise<void>;
-    createRealtimeSession(offerSdp: string): Promise<VoiceRealtimeClientSession>;
-    closeRealtimeSession(sessionId: string): Promise<void>;
-    validateCoordinatorToolCall(input: unknown): Promise<VoiceCoordinatorToolCall>;
   };
   notifications: {
     /** Fire-and-forget: report that an agent turn reached a terminal
@@ -463,6 +536,10 @@ export interface MakaBridge {
     pickFiles(): Promise<
       | { ok: true; files: { approvalId: string; name: string; mimeType?: string; size: number }[] }
       | { ok: false; reason: 'cancelled' }
+    >;
+    previewApproval(approvalId: string): Promise<
+      | { ok: true; base64: string; mimeType: string }
+      | { ok: false; reason: string }
     >;
     readBytes(sessionId: string, relativePath: string): Promise<
       | { ok: true; base64: string; mimeType: string }
@@ -656,6 +733,8 @@ export interface MakaBridge {
       arch: string;
       osRelease: string;
       workspacePath: string;
+      /** The OS home directory, for collapsing displayed paths to `~`. */
+      homePath: string;
       projectId?: string | null;
       projectPath: string;
       projectGit: { isGitRepo: boolean; branch?: string };
@@ -666,7 +745,6 @@ export interface MakaBridge {
     updateStatus(): Promise<AppUpdateStatus>;
     retryUpdateDownload(): Promise<AppUpdateStatus>;
     installUpdate(input: AppUpdateInstallRequest): Promise<AppUpdateInstallResult>;
-    openUpdateDownload(): Promise<{ ok: true } | { ok: false; reason: 'not_available' | 'open_failed' }>;
     sessionProjectInfo(sessionId: string): Promise<{
       projectPath: string;
       projectGit: { isGitRepo: boolean; branch?: string };

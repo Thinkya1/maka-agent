@@ -20,6 +20,58 @@ describe('FileConnectionStore', () => {
     });
   });
 
+  test('honors an explicit enabled model set on create', async () => {
+    await withConnectionStore(async (store) => {
+      const created = await store.create({
+        slug: 'opencode-free',
+        name: 'OpenCode Free',
+        providerType: 'opencode-free',
+        defaultModel: 'nemotron-3-ultra-free',
+        enabledModelIds: ['nemotron-3-ultra-free', 'mimo-v2.5-free', 'deepseek-v4-flash-free'],
+      });
+
+      assert.deepEqual(created.enabledModelIds, [
+        'nemotron-3-ultra-free',
+        'mimo-v2.5-free',
+        'deepseek-v4-flash-free',
+      ]);
+    });
+  });
+
+  // Onboarding "保存供应商" (and any other create path that only states a
+  // defaultModel) must land the same free inventory bootstrap seeds — not a
+  // one-model connection that then fails the first-run e2e contract.
+  test('creates OpenCode Free with the default free inventory when enabled models are omitted', async () => {
+    await withConnectionStore(async (store) => {
+      const created = await store.create({
+        slug: 'opencode-free',
+        name: 'OpenCode Free',
+        providerType: 'opencode-free',
+        defaultModel: 'nemotron-3-ultra-free',
+      });
+
+      assert.deepEqual(created.enabledModelIds, [
+        'nemotron-3-ultra-free',
+        'mimo-v2.5-free',
+        'deepseek-v4-flash-free',
+      ]);
+    });
+  });
+
+  test('still honors an explicit subset when creating OpenCode Free', async () => {
+    await withConnectionStore(async (store) => {
+      const created = await store.create({
+        slug: 'opencode-free',
+        name: 'OpenCode Free',
+        providerType: 'opencode-free',
+        defaultModel: 'nemotron-3-ultra-free',
+        enabledModelIds: ['nemotron-3-ultra-free'],
+      });
+
+      assert.deepEqual(created.enabledModelIds, ['nemotron-3-ultra-free']);
+    });
+  });
+
   test('migrates a legacy connection to only its default model enabled', async () => {
     await withConnectionStore(async (store, dir) => {
       await writeFile(
@@ -45,6 +97,165 @@ describe('FileConnectionStore', () => {
       const migrated = await store.get('openrouter-main');
 
       assert.deepEqual(migrated?.enabledModelIds, ['openrouter/auto']);
+    });
+  });
+
+  test('relay profiles sanitize on create and prune when a model is disabled', async () => {
+    await withConnectionStore(async (store) => {
+      const created = await store.create({
+        slug: 'my-relay',
+        name: 'My Relay',
+        providerType: 'openai-compatible',
+        baseUrl: 'https://relay.example/v1',
+        defaultModel: 'reasoner',
+        relayModelProfiles: {
+          reasoner: { thinkingLevels: ['high', 'low'], vision: true },
+          // Not in the seeded selection (only the default starts enabled), so
+          // the ⊆ enabledModelIds invariant drops it at the boundary.
+          'not-enabled': { vision: false },
+        },
+      });
+      assert.deepEqual(created.relayModelProfiles, {
+        reasoner: { thinkingLevels: ['low', 'high'], vision: true },
+      });
+
+      // Enabling a second model and declaring it keeps both profiles under an
+      // update that names no table.
+      await store.update(created.slug, {
+        enabledModelIds: ['reasoner', 'plain'],
+        relayModelProfiles: { reasoner: { vision: true }, plain: { contextWindow: 32_000 } },
+      });
+      // Disabling one model with no profile instruction prunes ONLY its row;
+      // the still-enabled model's declaration survives.
+      const pruned = await store.update(created.slug, { enabledModelIds: ['plain'] });
+      assert.deepEqual(pruned.enabledModelIds, ['plain']);
+      assert.deepEqual(pruned.relayModelProfiles, { plain: { contextWindow: 32_000 } });
+
+      // `null` clears the whole table outright.
+      const cleared = await store.update(created.slug, { relayModelProfiles: null });
+      assert.equal(cleared.relayModelProfiles, undefined);
+      const reloaded = await store.get(created.slug);
+      assert.equal(reloaded?.relayModelProfiles, undefined);
+    });
+  });
+
+  test('create keeps relay profiles for every model in the seeded enabled set', async () => {
+    await withConnectionStore(async (store) => {
+      const created = await store.create({
+        slug: 'import-relay',
+        name: 'Imported Relay',
+        providerType: 'openai-compatible',
+        baseUrl: 'https://relay.example/v1',
+        defaultModel: 'reasoner',
+        enabledModelIds: ['reasoner', 'plain'],
+        relayModelProfiles: {
+          reasoner: { thinkingLevels: ['high'], vision: true },
+          plain: { contextWindow: 16_000 },
+          // Still outside the selection — must not survive create.
+          ghost: { vision: false },
+        },
+      });
+      assert.deepEqual(created.enabledModelIds, ['reasoner', 'plain']);
+      assert.deepEqual(created.relayModelProfiles, {
+        reasoner: { thinkingLevels: ['high'], vision: true },
+        plain: { contextWindow: 16_000 },
+      });
+    });
+  });
+
+  test('relay profile invariants match the catalog codec on every write shape', async () => {
+    await withConnectionStore(async (store) => {
+      // Foreign providers carry no table at all — in create, update, and
+      // snapshot save alike (same gate the catalog codec enforces).
+      await assert.rejects(
+        () =>
+          store.create({
+            slug: 'openai-main',
+            name: 'OpenAI',
+            providerType: 'openai',
+            defaultModel: 'gpt-5',
+            relayModelProfiles: { 'gpt-5': { vision: true } },
+          }),
+        /openai-compatible/,
+      );
+      const plain = await store.create({
+        slug: 'openai-plain',
+        name: 'OpenAI Plain',
+        providerType: 'openai',
+        defaultModel: 'gpt-5',
+      });
+      assert.equal(plain.relayModelProfiles, undefined);
+      await assert.rejects(
+        () => store.update(plain.slug, { relayModelProfiles: { 'gpt-5': { vision: true } } }),
+        /openai-compatible/,
+      );
+      await assert.rejects(
+        () => store.save({ ...plain, relayModelProfiles: { 'gpt-5': { vision: true } } }),
+        /openai-compatible/,
+      );
+
+      const relay = await store.create({
+        slug: 'my-relay',
+        name: 'My Relay',
+        providerType: 'openai-compatible',
+        baseUrl: 'https://relay.example/v1',
+        defaultModel: 'reasoner',
+      });
+
+      // An update's explicit table is pruned against the FINAL selection,
+      // not taken as stated: keys for models outside it never land.
+      const tightened = await store.update(relay.slug, {
+        enabledModelIds: ['reasoner'],
+        relayModelProfiles: {
+          reasoner: { vision: true },
+          'freshly-listed': { vision: false },
+        },
+      });
+      assert.deepEqual(tightened.relayModelProfiles, { reasoner: { vision: true } });
+
+      // save() is the full-snapshot shape of the same rule: a snapshot
+      // naming a model the selection does not have loses that row rather
+      // than stranding it.
+      const saved = await store.save({
+        ...tightened,
+        relayModelProfiles: {
+          reasoner: { vision: false },
+          ghost: { vision: true },
+        },
+      });
+      assert.deepEqual(saved.relayModelProfiles, { reasoner: { vision: false } });
+      const reloaded = await store.get(relay.slug);
+      assert.deepEqual(reloaded?.relayModelProfiles, { reasoner: { vision: false } });
+
+      // Endpoint moves retire the table: declarations belong to the relay
+      // that answered for them, and a same-named model id on relay-b is a
+      // different model — the catalog document store enforces the same.
+      const moved = await store.update(relay.slug, {
+        baseUrl: 'https://relay-b.example/v1',
+      });
+      assert.equal(moved.relayModelProfiles, undefined);
+      const movedReloaded = await store.get(relay.slug);
+      assert.equal(movedReloaded?.relayModelProfiles, undefined);
+
+      // A table riding the moving update declares the NEW endpoint's facts,
+      // so it replaces as written (same rule as the catalog document store).
+      const movedWithTable = await store.update(relay.slug, {
+        baseUrl: 'https://relay-c.example/v1',
+        relayModelProfiles: { reasoner: { contextWindow: 64_000 } },
+      });
+      assert.deepEqual(movedWithTable.relayModelProfiles, {
+        reasoner: { contextWindow: 64_000 },
+      });
+
+      // Restating the SAME persisted endpoint is not a move: the comparison
+      // runs on persisted (trimmed, default-collapsed) values, so a routine
+      // edit that submits the unchanged endpoint cannot retire the table.
+      const restated = await store.update(relay.slug, {
+        baseUrl: 'https://relay-c.example/v1',
+      });
+      assert.deepEqual(restated.relayModelProfiles, {
+        reasoner: { contextWindow: 64_000 },
+      });
     });
   });
 
@@ -862,13 +1073,17 @@ describe('FileConnectionStore', () => {
 
       const migrated = await store.updateIfUnchanged(created.slug, created.updatedAt, {
         defaultModel: 'nemotron-3-ultra-free',
-        enabledModelIds: ['nemotron-3-ultra-free'],
-        extras: { makaBootstrap: { id: 'opencode-free', version: 2 } },
+        enabledModelIds: ['nemotron-3-ultra-free', 'mimo-v2.5-free', 'deepseek-v4-flash-free'],
+        extras: { makaBootstrap: { id: 'opencode-free', version: 3 } },
       });
       assert.equal(migrated?.defaultModel, 'nemotron-3-ultra-free');
-      assert.deepEqual(migrated?.enabledModelIds, ['nemotron-3-ultra-free']);
+      assert.deepEqual(migrated?.enabledModelIds, [
+        'nemotron-3-ultra-free',
+        'mimo-v2.5-free',
+        'deepseek-v4-flash-free',
+      ]);
       assert.deepEqual(migrated?.extras, {
-        makaBootstrap: { id: 'opencode-free', version: 2 },
+        makaBootstrap: { id: 'opencode-free', version: 3 },
       });
     });
   });

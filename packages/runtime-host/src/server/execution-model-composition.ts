@@ -4,6 +4,7 @@ import {
   isDeepResearchSession,
 } from '@maka/core/explore-agent';
 import { resolveModelVisionSupport } from '@maka/core/model-metadata';
+import { relayModelProfile } from '@maka/core/model-thinking';
 import { activePlanExecution, type PlanSessionState, type PlanStore } from '@maka/core/plan';
 import type { ModelCallAttempt } from '@maka/core/model-call-attempt';
 import type { RuntimePolicy } from '@maka/core/runtime-policy';
@@ -19,6 +20,7 @@ import {
   buildDefaultContextBudgetPolicy,
   buildHostCapabilitiesFromBinding,
   buildLlmHistorySummarizer,
+  assembleMainSessionSystemPrompt,
   buildPersonalizationPromptFragment,
   buildCancelPlanTool,
   buildParentAgentTools,
@@ -39,6 +41,7 @@ import {
   listRunnableBuiltinAgentDefinitions,
   projectEffectiveProductToolSurface,
   recordToolInvocation,
+  routeWebFetchTools,
   routeWebSearchTools,
   resolveProjectGitInfo,
   resolveSelectedModelContextWindow,
@@ -81,6 +84,7 @@ import {
 } from './oauth-execution-authority.js';
 import type { HostChildAgentBackendCapabilities } from './child-agent-composition.js';
 import type { HostExecutionArtifactServices } from './execution-artifacts.js';
+import type { HostMemoryExtractionCoordinator } from './memory-extraction-coordinator.js';
 import { readDuringBackendCreation, resolveExecutionTarget } from './execution-model-authority.js';
 import { toRuntimePolicyProxy } from './runtime-policy-proxy.js';
 
@@ -217,7 +221,11 @@ export function createHostExecutionModelComposition(
           childInstruction,
         ]);
       }
-      return joinFragments([
+      // Fragment order is load-bearing: the Deep Research mode contract
+      // (deepResearch) is a trailing assertion that constrains the fragments
+      // before it, so it must stay last. Keep this order in sync with the
+      // entry-level prompt-order test.
+      return assembleMainSessionSystemPrompt([
         buildPersonalizationPromptFragment(promptState.policy.personalization).text,
         skills.text,
         workspaceInstructions,
@@ -262,6 +270,7 @@ export interface HostAiSdkBackendInput {
   readonly claudeDeviceId: string;
   readonly skills: HostSkillCatalogCoordinator;
   readonly memory: HostMemoryCoordinator;
+  readonly memoryExtraction?: HostMemoryExtractionCoordinator;
   readonly taskLedger: TaskLedgerStore;
   readonly artifacts: InteractiveArtifactStoreWriter;
   readonly executionArtifacts: HostExecutionArtifactServices;
@@ -359,7 +368,7 @@ export async function createHostAiSdkBackend(input: HostAiSdkBackendInput): Prom
         : [];
     const candidateHostTools = [...(input.hostTools ?? []), ...rootTools];
     const webSearchRouting = {
-      tools: candidateHostTools,
+      tools: routeWebFetchTools(candidateHostTools, runtimePolicySnapshot.policy.privacy),
       settings: runtimePolicySnapshot.policy.webSearch,
       connection: target.connection,
       model: target.model,
@@ -369,13 +378,13 @@ export async function createHostAiSdkBackend(input: HostAiSdkBackendInput): Prom
     const boundTools = input.context.tools
       ? routeWebSearchTools({
           ...webSearchRouting,
-          tools: input.context.tools,
+          tools: routeWebFetchTools(input.context.tools, runtimePolicySnapshot.policy.privacy),
         })
       : undefined;
     const routedChildTools = input.childTools
       ? routeWebSearchTools({
           ...webSearchRouting,
-          tools: input.childTools,
+          tools: routeWebFetchTools(input.childTools, runtimePolicySnapshot.policy.privacy),
         })
       : undefined;
     const parentAgentTools = routedChildTools
@@ -572,6 +581,7 @@ export async function createHostAiSdkBackend(input: HostAiSdkBackendInput): Prom
           target.connection.providerType,
           target.connection.models,
           target.model,
+          relayModelProfile(target.connection, target.model)?.vision,
         ),
         readAttachmentBytes: createAttachmentByteReader({
           artifactStore: input.artifacts,
@@ -579,6 +589,12 @@ export async function createHostAiSdkBackend(input: HostAiSdkBackendInput): Prom
         }),
         recordToolArtifacts: input.executionArtifacts.recordToolArtifacts,
         toolResultArchive: input.executionArtifacts.toolResultArchive,
+        ...(!input.context.tools &&
+        !input.context.header.subagentParent &&
+        input.context.header.collaborationMode !== 'plan' &&
+        input.memoryExtraction
+          ? { memoryExtraction: input.memoryExtraction.sourceCapabilities() }
+          : {}),
         loadHistoryCompactCheckpoint: input.context.loadHistoryCompactCheckpoint,
         summarizeHistoryCompact: buildLlmHistorySummarizer({
           resolveModel: () =>

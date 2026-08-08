@@ -136,81 +136,51 @@
   background: transparent;
 }
 
-.maka-session-panel-footer .maka-sidebar-update-button {
-  margin-block-start: var(--space-1);
-}
-
-/* #1879: this rule used to force `height: 34px` onto an Astryx Button. It is a
-   `<Button size="md">` now (session-sidebar-nav.tsx), so the 32px comes from
-   the component's own `--size-element-md` — the same token the 32px nav rows
-   it stacks under already read. Overriding a component's size from product CSS
-   is the drift the control ruler exists to end; declaring no height here is
-   what makes the two agree by derivation instead of by coincidence. */
-.maka-sidebar-update-button {
-  font: var(--maka-text-heading-4);
-  position: relative;
-  min-width: 0;
-  display: inline-grid;
-  grid-template-columns: auto;
+/* Settings and the update action are siblings in one row (SessionSidebarFooter).
+   Everything the old chip needed from product CSS — a pill radius, an accent
+   background, hand-computed hover/pressed/downloading colors, an absolutely
+   positioned progress fill — is gone: it is an Astryx IconButton with
+   `variant="primary"` now, so shape, color and every state come from the
+   component and the theme's accent. What is left here is the one thing no
+   component can know, which is how the two controls share the row. */
+.maka-sidebar-footer-row {
+  display: flex;
   align-items: center;
   gap: var(--space-1);
-  /* Astryx Button reads `--_button-radius` for its own shape (Carousel and
-     Thumbnail set it the same way); declaring `border-radius` here would be a
-     product rule racing the component again. */
+}
+
+/* Collapsed the rail is 48px wide and the labels are gone; two controls cannot
+   sit side by side, so the row stacks and the update button keeps its slot.
+   Read off the frame, which is where the shell already writes the rail's
+   collapsed state (app-shell.tsx) and where the hairline rule above reads it
+   from: a second marker on this row would be the same fact written twice, free
+   to disagree with the first. */
+.appFrame[data-sidebar-state="collapsed"] .maka-sidebar-footer-row {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.maka-sidebar-footer-row-primary {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Stacked, the row stretches its children to the rail's width so the settings
+   row still fills it. A 28px button stretched to 32 is a pill, not the circle
+   it is expanded, so it opts out and keeps its own width. */
+.appFrame[data-sidebar-state="collapsed"] .maka-sidebar-update-button {
+  align-self: center;
+}
+
+.maka-sidebar-update-button {
+  flex: none;
+  /* Astryx has no shape prop — `isIconOnly` is documented as rendering a
+     SQUARE button — but Button reads `--_button-radius` for its own geometry,
+     which is how Carousel and Thumbnail reshape it too. Setting that variable
+     asks the component to be round; declaring `border-radius` here would race
+     it instead. On a 28px square this resolves to a true circle. */
   --_button-radius: var(--radius-pill);
-  padding: 0 var(--space-3);
-  /* `background-color`, not the `background` shorthand — here and in EVERY
-     state rule below. The shorthand also resets `background-image`, which is
-     where Button's ghost variant keeps its hover and pressed overlays, so a
-     single shorthand anywhere in this file cancels the `variant` the component
-     was given. Product CSS is in the last cascade layer, so it wins that reset
-     regardless of specificity; fixing only the base rule left the overlays
-     dead on hover and in both download states, which is where they are most
-     visible. `border: 0` and `box-shadow: none` used to sit here too; both
-     restated what Button already computes. */
-  background-color: var(--control);
-  color: var(--control-foreground);
-  overflow: hidden;
   -webkit-app-region: no-drag;
-  transition:
-    background-color var(--duration-base) var(--ease-out-strong),
-    transform var(--duration-quick) var(--ease-out-strong);
-}
-
-.maka-sidebar-update-button > span:not(.maka-sidebar-update-progress) {
-  position: relative;
-}
-
-.maka-sidebar-update-button[data-update-state="downloading"] {
-  cursor: default;
-  background-color: oklch(from var(--control) calc(l + 0.04) calc(c * 0.68) h);
-  opacity: 1;
-}
-
-.maka-sidebar-update-button[data-update-state="downloaded"] {
-  background-color: var(--control);
-}
-
-.maka-sidebar-update-progress {
-  position: absolute;
-  inset: 0;
-  transform: scaleX(var(--maka-update-progress, 0));
-  transform-origin: left center;
-  background-color: oklch(from var(--control) calc(l - 0.08) c h);
-  transition: transform var(--duration-base) var(--ease-out-strong);
-}
-
-.maka-sidebar-update-button:hover {
-  background-color: oklch(from var(--control) calc(l - 0.04) c h);
-}
-
-.maka-sidebar-update-button:disabled:hover {
-  background-color: oklch(from var(--control) calc(l + 0.04) calc(c * 0.68) h);
-}
-
-.maka-sidebar-update-button:focus-visible {
-  outline: var(--focus-ring-width) solid var(--focus-ring);
-  outline-offset: var(--focus-ring-offset);
 }
 
 .maka-session-row {
@@ -218,15 +188,32 @@
   -webkit-app-region: no-drag;
 }
 
-/* SideNavItem needs a truthy child to retain its disclosure control. Collapsed
- * session trees provide this sentinel instead of mounting every Swarm child. */
-.maka-session-lazy-children-sentinel {
-  display: none;
+/*
+ * Group-header new-task trigger (session-history-list.tsx): the compact plus
+ * on the Pinned / Recent section titles.
+ *
+ * Size: Astryx IconButton ships sm/md/lg (28/32/40px) — there is no xs. The
+ * trigger deliberately takes the rail's compact control step instead
+ * (--h-control-sm, 24px — the same box the rows' trailing ⋯ column is
+ * measured in), so the section header gains almost no height; one product
+ * size override is the cost. !important for the same reason as every other
+ * StyleX override in this file.
+ *
+ * Column alignment needs no margin: the header's endContent and the rows'
+ * trailing column are both 24px boxes right-aligned to the SAME content edge
+ * (the SideNav scrollable zone's spacing-2 plus their own spacing-2
+ * paddingInline on each side), so the plus centre lands on the ⋯ column's
+ * centre by layout. Title entry, row actions — one vertical action column,
+ * one eye sweep.
+ */
+.maka-group-new-task-button {
+  width: var(--h-control-sm, 24px) !important;
+  height: var(--h-control-sm, 24px) !important;
 }
 
 /*
  * Dim only this row's SideNavItem. Child combinators stop before [role=group]
- * nests, so a stale parent never mutes healthy subagent rows underneath.
+ * nests under project groups.
  * DOM: .maka-session-row > SideNavItem root > .astryx-side-nav-item
  * (leaf: button; collapsible parent: split-action row that may host the
  * primary control with aria-current).
@@ -240,17 +227,13 @@
   opacity: 1;
 }
 
-.maka-session-row[data-subagent="true"] .astryx-side-nav-item {
-  color: var(--foreground-secondary);
-}
-
 /*
  * Project groups are a section label + peer sessions, not a deep tree.
  * Astryx SideNavItem always pads children with spacing-6 (24px); that is the
  * shell-side-nav workspace pattern, but it wastes a full icon column in a
  * narrow session rail. Zero only the project item's own nest so sessions share
- * the time-sort left edge. Do not use a descendant selector — that would also
- * punch through subagent trees under session rows inside the project.
+ * the time-sort left edge. Child combinator only — do not use a descendant
+ * selector that would punch deeper nest levels if any appear later.
  * DOM: .maka-project-row > SideNavItem root > [role=group] > childrenInner
  */
 .maka-project-row > div > [role="group"] > div {
@@ -287,27 +270,6 @@
 .maka-session-worktree-icon {
   flex: 0 0 auto;
   color: var(--muted-foreground);
-}
-
-.maka-session-row--editing {
-  padding-inline: var(--space-2);
-  padding-block: var(--space-1);
-}
-
-.maka-session-rename-input {
-  font: var(--maka-text-heading-4);
-  width: 100%;
-  min-width: 0;
-  border: 0;
-  border-bottom: var(--border-width-hairline) solid oklch(from var(--focus-ring) l c h / 0.4);
-  background: transparent;
-  color: var(--foreground);
-  outline: 0;
-  padding: 1px 0;
-}
-
-.maka-session-rename-input:focus {
-  border-bottom-color: var(--focus-ring);
 }
 
 /* #1879: an Astryx `Badge variant="yellow"` now. Box, radius, padding and

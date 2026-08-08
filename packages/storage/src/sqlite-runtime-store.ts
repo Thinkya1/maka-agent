@@ -19,6 +19,8 @@ import {
   stableJsonStringify,
   TOOL_BOUNDARY_PROTOCOL_V1,
   TOOL_RECOVERY_BUNDLE_CAPABILITY_V1,
+  ToolLedgerCorruptionError,
+  ToolLedgerRejectionError,
   WORKSPACE_AUTHORITY_SESSION_ID,
   WORKSPACE_VERSION_AUTHORITY_CAPABILITY_V1,
   validateGenericToolLedgerAppend,
@@ -147,6 +149,12 @@ export interface ToolCommitResult {
 
 export interface RuntimeEventBatchImportResult {
   created: boolean[];
+}
+
+/** Storage-owned, immutable append position for an Event within one Session. */
+export interface SessionRuntimeEventEntry {
+  readonly ordinal: number;
+  readonly event: RuntimeEvent;
 }
 
 export interface ToolProjectionRebuildResult {
@@ -907,6 +915,34 @@ export class SqliteRuntimeStore
         a.event.id.localeCompare(b.event.id),
     );
     return ordered.map((item) => item.event);
+  }
+
+  async readSessionRuntimeEventEntries(sessionId: string): Promise<SessionRuntimeEventEntry[]> {
+    assertRuntimeStorageSafeId(sessionId, 'Invalid session id');
+    const rows = this.db
+      .prepare(`
+        SELECT o.ordinal, e.event_id, e.session_id, e.invocation_id, e.run_id, e.turn_id,
+               e.payload_json
+        FROM runtime_session_event_ordinals o
+        JOIN runtime_events e ON e.event_id = o.event_id
+        WHERE o.session_id = ?
+        ORDER BY o.ordinal ASC
+      `)
+      .all(sessionId) as unknown as Array<RuntimeEventStorageRow & { ordinal: unknown }>;
+    return rows.map((row) => {
+      if (
+        typeof row.ordinal !== 'number' ||
+        !Number.isSafeInteger(row.ordinal) ||
+        row.ordinal < 1
+      ) {
+        throw new Error(`Invalid RuntimeEvent Session ordinal for ${sessionId}`);
+      }
+      const event = decodeRuntimeEventStorageRow(row);
+      if (event.sessionId !== sessionId) {
+        throw new Error(`RuntimeEvent Session ordinal identity mismatch for ${event.id}`);
+      }
+      return { ordinal: row.ordinal, event };
+    });
   }
 
   async #commitWorkspaceBaseline(
@@ -2189,9 +2225,7 @@ export class SqliteRuntimeStore
       expectedTransition,
     });
     if (!validation.ok) {
-      throw new Error(
-        `Tool ledger transition rejected: ${validation.code} at ${validation.eventId}`,
-      );
+      throw new ToolLedgerRejectionError(validation.code, validation.eventId);
     }
   }
 
@@ -2203,9 +2237,12 @@ export class SqliteRuntimeStore
     const health = this.toolLedgerHealth!;
     if (health.decodeFailure) throw health.decodeFailure.error;
     if (health.issue) {
-      throw new Error(
-        `Tool ledger transition rejected: ${health.issue.code} at ${health.issue.eventId}`,
-      );
+      // Pre-existing damage, not a bad candidate. Note the reach of "refused":
+      // this gate is only ever consulted for tool-bearing events, so a damaged
+      // ledger refuses tool facts and takes everything else. Callers that treat
+      // this as "the store is gone" are overreading it — see the note on the
+      // latch in `AgentRun.enqueueRuntimeEventStore`.
+      throw new ToolLedgerCorruptionError(health.issue.code, health.issue.eventId);
     }
   }
 
@@ -2503,6 +2540,23 @@ export class SqliteRuntimeStore
         encoding.json,
         committedAt,
       );
+    const ordinalRow = this.db
+      .prepare(`
+        SELECT COALESCE(MAX(ordinal), 0) + 1 AS next_ordinal
+        FROM runtime_session_event_ordinals
+        WHERE session_id = ?
+      `)
+      .get(canonicalEvent.sessionId) as { next_ordinal?: unknown };
+    const ordinal = ordinalRow.next_ordinal;
+    if (typeof ordinal !== 'number' || !Number.isSafeInteger(ordinal) || ordinal < 1) {
+      throw new Error(`Invalid next RuntimeEvent Session ordinal for ${canonicalEvent.sessionId}`);
+    }
+    this.db
+      .prepare(`
+        INSERT INTO runtime_session_event_ordinals(session_id, ordinal, event_id)
+        VALUES (?, ?, ?)
+      `)
+      .run(canonicalEvent.sessionId, ordinal, canonicalEvent.id);
     this.deleteCompletedPartialSnapshot(canonicalEvent);
     return next;
   }

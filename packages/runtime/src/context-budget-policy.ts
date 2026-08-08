@@ -1,6 +1,8 @@
 import type { RuntimeExecutionConnection } from '@maka/core/llm-connections';
 import { lookupModelMetadata } from '@maka/core/model-metadata';
+import { relayModelProfile } from '@maka/core/model-thinking';
 import type { ContextBudgetPolicy } from './context-budget.js';
+import { finitePositive } from './context-budget-helpers.js';
 
 export interface BuildDefaultContextBudgetPolicyOptions {
   name?: string;
@@ -412,15 +414,38 @@ export function resolveSelectedModelContextWindow(
   modelId: string | undefined,
 ): number | undefined {
   const selectedModelId = modelId ?? connection.defaultModel;
-  const model = selectedModelId
-    ? connection.models?.find((candidate) => candidate.id === selectedModelId)
-    : undefined;
+  if (selectedModelId === undefined) return undefined;
+  // A user declaration outranks both the relay's /models report and generated
+  // metadata — mirrors the declared-vision precedence in model-metadata.ts,
+  // through the same provider-gated seam (relay declarations only).
+  const declared = relayModelProfile(connection, selectedModelId)?.contextWindow;
+  if (declared !== undefined) return declared;
+  const model = connection.models?.find((candidate) => candidate.id === selectedModelId);
   return (
     model?.contextWindow ??
-    (selectedModelId
-      ? lookupModelMetadata(connection.providerType, selectedModelId).contextWindow
-      : undefined)
+    lookupModelMetadata(connection.providerType, selectedModelId).contextWindow
   );
+}
+
+export interface ContextBudgetCapacity {
+  tokens: number;
+  source: 'selected_model' | 'policy_fallback';
+}
+
+export function resolveContextBudgetCapacity(
+  connection: RuntimeExecutionConnection,
+  modelId: string | undefined,
+  policy: ContextBudgetPolicy | undefined,
+): ContextBudgetCapacity | undefined {
+  const selectedWindow = resolveSelectedModelContextWindow(connection, modelId);
+  if (selectedWindow !== undefined) {
+    return { tokens: selectedWindow, source: 'selected_model' };
+  }
+
+  const historyBudget = finitePositive(policy?.maxHistoryEstimatedTokens);
+  const reserveTokens = finitePositive(policy?.historyCompact?.midTurn?.reserveTokens);
+  if (historyBudget === undefined || reserveTokens === undefined) return undefined;
+  return { tokens: historyBudget + reserveTokens, source: 'policy_fallback' };
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {

@@ -1,6 +1,7 @@
 node_modules
 dist
 dist-renderer
+test-results
 storybook-static
 .DS_Store
 *.log
@@ -16,6 +17,9 @@ __pycache__/
 skills-lock.json
 # PR-IR-01 captured screenshots — generated artifacts, not committed.
 apps/desktop/tests/screenshots/
+# Temporary PR/issue visual evidence — attach on GitHub, do not commit under docs/.
+docs/screenshots/
+docs/assets/
 # Generated real-window smoke reports contain machine-local paths and PIDs.
 apps/desktop/tests/real-window-smoke/
 deepseek.key
@@ -27,3 +31,4 @@ apps/desktop/bundled-git.json
 # Generated desktop release inputs and outputs.
 apps/desktop/resources/tools/
 apps/desktop/release/
+apps/desktop/release-sources/

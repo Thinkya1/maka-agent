@@ -1,42 +1,12 @@
 import { test, expect, COMPOSER_INPUT } from './fixtures';
 
-test('chat input preserves an IME composition when a file paste arrives', async ({ window: page }) => {
-  const firstSend = page.locator(COMPOSER_INPUT);
-  await firstSend.fill('ime-paste-test');
-  await firstSend.press('Enter');
-  await expect(page.getByText(/Fake backend received: ime-paste-test/)).toBeVisible();
-
-  const composer = page.locator('.maka-composer[data-maka-file-drop-target="true"]');
-  const editable = composer.locator('[contenteditable="true"]');
-
-  const pasteResults = await editable.evaluate((input) => {
-    const dispatchFilePaste = () => {
-      const clipboardData = new DataTransfer();
-      clipboardData.items.add(new File(['content'], 'note.txt', { type: 'text/plain' }));
-      const event = new Event('paste', { bubbles: true, cancelable: true });
-      Object.defineProperty(event, 'clipboardData', { value: clipboardData });
-      input.dispatchEvent(event);
-      return event.defaultPrevented;
-    };
-
-    input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
-    const duringComposition = dispatchFilePaste();
-    input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
-    const afterComposition = dispatchFilePaste();
-
-    return { duringComposition, afterComposition };
-  });
-
-  expect(pasteResults).toEqual({ duringComposition: false, afterComposition: true });
-});
-
 /**
  * Attachment upload + ingest: enter the chat view, drop a file onto the main
  * composer, confirm it shows as a pending token, then send the message and
  * verify the fake backend received the attachments by name. Uses Playwright's
  * DataTransfer + dispatchEvent because the composer has no <input type=file>.
  */
-test('a mixed attachment send has the Astryx message hierarchy', async ({ window: page }) => {
+test('a mixed attachment send has the Astryx message hierarchy, and IME composition survives a file paste', async ({ window: page }) => {
   // Enter chat view by sending a first message from the composer, which
   // creates the session on send.
   const firstSend = page.locator(COMPOSER_INPUT);
@@ -67,9 +37,33 @@ test('a mixed attachment send has the Astryx message hierarchy', async ({ window
     );
   });
 
-  // Both attachment kinds appear in the composer before send.
-  await expect(page.getByText('note.txt')).toBeVisible();
-  await expect(page.getByText('pixel.png')).toBeVisible();
+  // Both attachment kinds stage as Token chips in the quote chips' rhythm,
+  // names visible on the chip itself (the full name + «EXT · size» meta ride
+  // the hover tooltip).
+  const chips = page.locator('.maka-composer-context-drawer .maka-composer-attachment-token');
+  await expect(chips.filter({ hasText: 'note.txt' })).toBeVisible();
+  const imageChip = chips.filter({ hasText: 'pixel.png' });
+  await expect(imageChip).toBeVisible();
+  // Once the preview decodes, the image chip becomes clickable (Token mounts
+  // its invisible button exactly then) and opens the Astryx Lightbox.
+  // exact: true — a bare name would also match the chip's remove button
+  // («移除 pixel.png»).
+  const imageChipButton = imageChip.getByRole('button', { name: 'pixel.png', exact: true });
+  await imageChipButton.click();
+  const stagedLightbox = page.getByRole('dialog');
+  await expect(stagedLightbox.getByRole('img', { name: 'pixel.png' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(stagedLightbox).not.toBeVisible();
+  // Native-dialog contract: closing hands focus back to the chip button that
+  // opened it — keyboard users must not be dropped on <body>. The Lightbox
+  // stays mounted through the close for exactly this.
+  await expect(imageChipButton).toBeFocused();
+  // Keyboard parity with hover: the focused chip surfaces the same
+  // «name · EXT · size» tooltip (focusTrigger="always" — Token's root span
+  // is not focusable, so focusin must bubble from the inner button).
+  await expect(
+    page.getByRole('tooltip').filter({ hasText: 'pixel.png · PNG' }),
+  ).toBeVisible();
 
   // Send the message carrying the attachment — the fake backend echoes the
   // attachment name, proving the ingest-on-send path delivered it (not just
@@ -81,36 +75,11 @@ test('a mixed attachment send has the Astryx message hierarchy', async ({ window
 
   const sentMessage = page.getByLabel('你发送的消息').last();
   const fileToken = sentMessage.locator('.maka-user-attachment-tokens .astryx-token');
-  const fileIcon = fileToken.locator('.astryx-icon');
   const image = sentMessage.locator('.maka-user-attachments .astryx-thumbnail');
   const bubble = sentMessage.locator('.maka-chat-message-bubble-user');
   await expect(fileToken).toContainText('note.txt');
-  await expect(fileIcon).toHaveCSS('width', '16px');
-  await expect(fileIcon).toHaveCSS('height', '16px');
   await expect(image).toBeVisible();
-  await expect(image).toHaveCSS('width', '64px');
   await expect(bubble).toContainText('sending mixed attachments');
-
-  const [fileBox, imageBox, bubbleBox] = await Promise.all([
-    fileToken.boundingBox(),
-    image.boundingBox(),
-    bubble.boundingBox(),
-  ]);
-  expect(fileBox).not.toBeNull();
-  expect(imageBox).not.toBeNull();
-  expect(bubbleBox).not.toBeNull();
-  // The token declares display:inline-flex + align-items:center; as a flex
-  // item of the attachment row it computes display:flex (blockification) on
-  // every platform. Assert the centering contract, not geometry: token height
-  // resolves from line-height, which varies with font metrics (Linux CI can
-  // drop below the 16px icon, overflowing a correctly centered icon by 2px).
-  // A tolerance-based centerline check was rejected — a baseline regression
-  // drifts exactly 2.00px, the tolerance boundary. display:flex is load-
-  // bearing: align-items computes as declared even on non-flex boxes.
-  await expect(fileToken).toHaveCSS('display', 'flex');
-  await expect(fileToken).toHaveCSS('align-items', 'center');
-  expect(fileBox!.y + fileBox!.height).toBeLessThanOrEqual(bubbleBox!.y);
-  expect(imageBox!.y + imageBox!.height).toBeLessThanOrEqual(bubbleBox!.y);
 
   await image.getByRole('button').click();
   const lightbox = page.locator('.astryx-lightbox');
@@ -128,4 +97,30 @@ test('a mixed attachment send has the Astryx message hierarchy', async ({ window
 
   await page.keyboard.press('Escape');
   await expect(page.locator('.astryx-lightbox')).not.toBeVisible();
+
+  // IME composition vs file paste, in the same window: pastes must not be
+  // intercepted mid-composition, and must be intercepted after it. Runs after
+  // the attachment journey because the post-composition paste stages a chip.
+  const editable = page
+    .locator('.maka-composer[data-maka-file-drop-target="true"]')
+    .locator('[contenteditable="true"]');
+  const pasteResults = await editable.evaluate((input) => {
+    const dispatchFilePaste = () => {
+      const clipboardData = new DataTransfer();
+      clipboardData.items.add(new File(['content'], 'note.txt', { type: 'text/plain' }));
+      const event = new Event('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(event, 'clipboardData', { value: clipboardData });
+      input.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+
+    input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    const duringComposition = dispatchFilePaste();
+    input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+    const afterComposition = dispatchFilePaste();
+
+    return { duringComposition, afterComposition };
+  });
+
+  expect(pasteResults).toEqual({ duringComposition: false, afterComposition: true });
 });

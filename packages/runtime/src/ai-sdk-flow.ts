@@ -424,7 +424,12 @@ function mapBackendSessionEvent(
         // Canonical content + steering marker: read models may prefer
         // displayText, while model replay uses text and materializes attachments.
         content: { kind: 'text', ...normalizeMessageContent(event.content), steering: true },
-        refs: { providerEventId: event.messageId },
+        refs: {
+          providerEventId: event.messageId,
+          ...(event.submittedContentDigest
+            ? { sourceMessageDigest: event.submittedContentDigest }
+            : {}),
+        },
       };
 
     // (queue_update is deliberately NOT mappable: the kernel is its only
@@ -724,7 +729,6 @@ export class AiSdkFlow implements AgentFlow, AgentFlowControl {
           ? { headAnchorRuntimeEvent: ctx.request.initialRuntimeEvent }
           : {}),
         text: input.text,
-        ...(input.voiceAudio !== undefined ? { voiceAudio: input.voiceAudio } : {}),
         ...(input.attachments !== undefined ? { attachments: input.attachments } : {}),
         ...(input.quotes !== undefined ? { quotes: input.quotes } : {}),
         context: input.context,

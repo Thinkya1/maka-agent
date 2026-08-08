@@ -12,6 +12,8 @@ export interface LiveThinkingProjection {
   text: string;
   truncated: boolean;
   complete: boolean;
+  /** Raw source length, independent of redaction and display truncation. */
+  sourceEndOffset?: number;
 }
 
 export interface LiveTurnStepProjection {
@@ -28,12 +30,21 @@ export interface LiveTextProjection {
   text: string;
   truncated: boolean;
   complete: boolean;
+  /** Raw source length, independent of redaction and display truncation. */
+  sourceEndOffset?: number;
+}
+
+export interface LiveSteeringProjection {
+  id: string;
+  text: string;
+  ts: number;
 }
 
 export interface LiveTurnProjection {
   turnId: string;
   phase: 'waiting' | 'streamed';
   terminal?: true;
+  steering?: LiveSteeringProjection[];
   /**
    * Set by `armLiveTurn` and cleared by the first word the authority says about
    * this turn (`confirmLiveTurn`, or any event carrying the same turnId).
@@ -133,6 +144,26 @@ export function applyLiveTurnEvent(
   event: SessionEvent,
   locale: UiLocale = 'zh',
 ): LiveTurnProjection | undefined {
+  if (event.type === 'steering_message') {
+    const prior = current?.turnId === event.turnId
+      ? current
+      : { turnId: event.turnId, phase: 'waiting' as const, steps: [] };
+    const steering = prior.steering ?? [];
+    if (steering.some((message) => message.id === event.messageId)) {
+      return confirmed(prior);
+    }
+    return {
+      ...confirmed(prior),
+      steering: [
+        ...steering,
+        {
+          id: event.messageId,
+          text: event.content.displayText ?? event.content.text,
+          ts: event.ts,
+        },
+      ],
+    };
+  }
   if (event.type === 'provider_retry') {
     const prior = current?.turnId === event.turnId
       ? current
@@ -148,7 +179,9 @@ export function applyLiveTurnEvent(
   }
   if (event.type === 'complete') {
     if (!current || current.turnId !== event.turnId) return current;
-    if (current.steps.length === 0) return undefined;
+    if (current.steps.length === 0 && (current.steering?.length ?? 0) === 0) {
+      return undefined;
+    }
     const { providerRetry: _providerRetry, ...withoutRetry } = confirmed(current);
     return {
       ...withoutRetry,
@@ -189,13 +222,17 @@ export function applyLiveTurnEvent(
   const step = stepIndex >= 0 ? prior.steps[stepIndex]! : { stepId, tools: [] };
   let nextStep: LiveTurnStepProjection;
   if (event.type === 'thinking_delta') {
-    const applied = applyThinkingDelta(step.thinking?.text ?? '', event.text, { locale });
+    const delta = replaySafeDelta(step.thinking?.sourceEndOffset, event);
+    const applied = applyThinkingDelta(step.thinking?.text ?? '', delta.text, { locale });
     nextStep = {
       ...step,
       thinking: {
         text: applied.text,
         truncated: (step.thinking?.truncated ?? false) || applied.truncated,
         complete: false,
+        ...(delta.sourceEndOffset === undefined
+          ? {}
+          : { sourceEndOffset: delta.sourceEndOffset }),
       },
     };
   } else if (event.type === 'thinking_complete') {
@@ -206,16 +243,23 @@ export function applyLiveTurnEvent(
         text: applied.text,
         truncated: applied.truncated,
         complete: true,
+        ...(step.thinking?.sourceEndOffset === undefined
+          ? {}
+          : { sourceEndOffset: event.text.length }),
       },
     };
   } else if (event.type === 'text_delta') {
-    const applied = applyAssistantDelta(step.text?.text ?? '', event.text, { locale });
+    const delta = replaySafeDelta(step.text?.sourceEndOffset, event);
+    const applied = applyAssistantDelta(step.text?.text ?? '', delta.text, { locale });
     nextStep = {
       ...step,
       text: {
         text: applied.text,
         truncated: (step.text?.truncated ?? false) || applied.truncated,
         complete: false,
+        ...(delta.sourceEndOffset === undefined
+          ? {}
+          : { sourceEndOffset: delta.sourceEndOffset }),
       },
     };
   } else if (event.type === 'text_complete') {
@@ -226,6 +270,9 @@ export function applyLiveTurnEvent(
         text: applied.text,
         truncated: applied.truncated,
         complete: true,
+        ...(step.text?.sourceEndOffset === undefined
+          ? {}
+          : { sourceEndOffset: event.text.length }),
       },
     };
   } else if (event.type === 'tool_start') {
@@ -332,6 +379,29 @@ export function applyLiveTurnEvent(
       : [...prior.steps, nextStep];
   }
   return { ...priorWithoutRetry, phase: 'streamed', steps };
+}
+
+function replaySafeDelta(
+  currentEndOffset: number | undefined,
+  event: Extract<SessionEvent, { type: 'text_delta' | 'thinking_delta' }>,
+): { text: string; sourceEndOffset?: number } {
+  if (event.startOffset === undefined) {
+    return {
+      text: event.text,
+      ...(currentEndOffset === undefined
+        ? {}
+        : { sourceEndOffset: currentEndOffset + event.text.length }),
+    };
+  }
+  const endOffset = event.startOffset + event.text.length;
+  if (currentEndOffset === undefined || event.startOffset > currentEndOffset) {
+    return { text: event.text, sourceEndOffset: endOffset };
+  }
+  const overlapLength = Math.min(currentEndOffset - event.startOffset, event.text.length);
+  return {
+    text: event.text.slice(overlapLength),
+    sourceEndOffset: Math.max(currentEndOffset, endOffset),
+  };
 }
 
 /**

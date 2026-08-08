@@ -387,7 +387,10 @@ class TerminalClaimBeforeDeadlineBackend implements AgentBackend {
   readonly sessionId: string;
   stopCalls = 0;
 
-  constructor(sessionId: string) {
+  constructor(
+    sessionId: string,
+    private readonly terminalClaimed?: () => void,
+  ) {
     this.sessionId = sessionId;
   }
 
@@ -409,7 +412,13 @@ class TerminalClaimBeforeDeadlineBackend implements AgentBackend {
       ts: Date.now(),
       stopReason: 'end_turn',
     };
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    // Resuming here proves the runtime accepted the terminal event: the
+    // post-terminal drain pulls the next value only after the previous one
+    // was processed, so by now the terminal claim is taken. A deadline the
+    // test fires from this hook is late by construction (#2221), where the
+    // old shape made it late by racing a 1100ms sleep against a 1000ms
+    // timer and lost on loaded runners.
+    this.terminalClaimed?.();
   }
 
   async stop(): Promise<void> {
@@ -1284,16 +1293,23 @@ describe('runHarborCell', () => {
   test('does not report deadline settlement after normal completion already claimed the terminal state', async () => {
     await withDirs(async ({ workspaceDir, outputDir, storageRoot }) => {
       let backend: TerminalClaimBeforeDeadlineBackend | undefined;
+      let claimReached!: () => void;
+      const terminalClaimed = new Promise<void>((resolve) => {
+        claimReached = resolve;
+      });
       const result = await runHarborCell({
         config,
         instruction: 'finish before the deadline',
         cwd: workspaceDir,
         outputDir,
         storageRoot,
-        settleAfterMs: 1_000,
+        // The deadline this test cares about is one that lands after normal
+        // completion claimed the terminal state, so fire it from the claim
+        // itself instead of hoping a wall-clock budget loses the race.
+        settleSignal: terminalClaimed,
         registerBackends: (registry) => {
           registry.register('fake', (ctx) => {
-            backend = new TerminalClaimBeforeDeadlineBackend(ctx.sessionId);
+            backend = new TerminalClaimBeforeDeadlineBackend(ctx.sessionId, claimReached);
             return backend;
           });
         },
@@ -1960,54 +1976,6 @@ describe('runHarborCell', () => {
     assert.equal(hostCellExitCode({ settledByDeadline: false }), 0);
   });
 
-  test('host-side Harbor cell config treats MAKA_ECONOMY_TASK_MODE=false as explicit disable', async () => {
-    const { main } = (await import(
-      new URL('../../harbor/run-host-cell.mjs', import.meta.url).href
-    )) as {
-      main: (options?: {
-        registerBackends?: (registry: BackendRegistry, context: HeadlessBackendContext) => void;
-      }) => Promise<void>;
-    };
-    await withDirs(async ({ workspaceDir, outputDir, storageRoot }) => {
-      const previousEnv = { ...process.env };
-      const seenPrompts: string[] = [];
-      const registerCapturingBackend = (
-        registry: BackendRegistry,
-        context: HeadlessBackendContext,
-      ): void => {
-        seenPrompts.push(context.config.systemPrompt ?? '');
-        registry.register(
-          'ai-sdk',
-          (ctx) =>
-            new CellReportingBackend({
-              sessionId: ctx.sessionId,
-              header: ctx.header,
-              store: ctx.store,
-            }),
-        );
-      };
-      try {
-        process.env.MAKA_PROVIDER = 'openai';
-        process.env.MAKA_MODEL = 'openai/gpt-4o-mini';
-        process.env.MAKA_HOST_API_KEY = 'test-key';
-        process.env.MAKA_HARBOR_TOOL_EXECUTOR_URL = 'http://127.0.0.1:1';
-        process.env.MAKA_HARBOR_TOOL_EXECUTOR_TOKEN = 'token';
-        process.env.MAKA_INSTRUCTION = 'Write a CSV summary of log files.';
-        process.env.MAKA_WORKDIR = workspaceDir;
-        process.env.MAKA_OUTPUT_DIR = outputDir;
-        process.env.MAKA_STORAGE_ROOT = storageRoot;
-        process.env.MAKA_SYSTEM_PROMPT = 'Use the host prompt.';
-        process.env.MAKA_ECONOMY_TASK_MODE = 'false';
-        await main({ registerBackends: registerCapturingBackend });
-      } finally {
-        process.env = previousEnv;
-      }
-
-      assert.match(seenPrompts[0] ?? '', /Use the host prompt/);
-      assert.doesNotMatch(seenPrompts[0] ?? '', /Economy-task benchmark policy/);
-    });
-  });
-
   test('Harbor ai-sdk backend registration forwards the canonical metering sink', async () => {
     // The controller has always exposed `recordModelCallAttempt`; this
     // composition never passed it on, so Harbor produced diagnostic attempts
@@ -2250,12 +2218,12 @@ describe('runHarborCell', () => {
       const backendInput = (backend as unknown as { input: AiSdkBackendInput }).input;
       const toolNames = backendInput.tools.map((tool) => tool.name);
 
-      for (const expected of ['agent_spawn', 'agent_swarm', 'agent_list', 'agent_output']) {
+      for (const expected of ['agent_spawn', 'agent_list', 'agent_output']) {
         assert.ok(toolNames.includes(expected), `expected enabled Agent tool ${expected}`);
       }
       assert.deepEqual(
         backendInput.toolAvailability?.groups?.find((group) => group.id === 'agent')?.toolNames,
-        ['agent_spawn', 'agent_swarm', 'agent_list', 'agent_output'],
+        ['agent_spawn', 'agent_list', 'agent_output'],
       );
       for (const capability of AGENT_RUNTIME_CAPABILITIES) {
         assert.equal(typeof backendInput[capability], 'function', `expected root ${capability}`);

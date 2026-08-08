@@ -2,7 +2,6 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type React
 import {
   AlertTriangle,
   ArrowRight,
-  TextQuote,
 } from './icons.js';
 import { DeepResearchEmptyHero, EmptyChatHero } from './chat-empty-hero.js';
 import type { ChatModelChoice } from './chat-model-helpers.js';
@@ -23,10 +22,9 @@ import { materializeChat } from './materialize.js';
 import { useTranscriptProjection } from './use-transcript-projection.js';
 import type { LiveTurnProjection } from './live-turn-projection.js';
 import {
-  ModelContinuingIndicator,
   ModelProviderRetryIndicator,
   LocalizedChatMessage,
-  ModelProcessingIndicator,
+  TurnRunningStatus,
   TurnView,
   type ReadAttachmentBytes,
   type TurnFooterActionMeta,
@@ -51,19 +49,16 @@ export function ChatView(props: {
   /** Called once the streaming bubble has displayed the final text and can hand off to history. */
   onStreamingSettled?(messageId?: string): void;
   /**
-   * #646: true while the first-token wait indicator ("正在处理…") should show —
-   * the turn is armed at send with no content event yet. Rendered as a transient
-   * trailing entry of the tail turn, covering only the connect-to-first-token gap.
+   * True while the live turn's running status line (spinner · working phrase ·
+   * elapsed clock) should show, as the trailing entry of the tail turn.
+   *
+   * One flag for the whole turn, replacing the #646 pair that split the wait
+   * into a first-token cue and a mid-turn one and showed neither once the turn
+   * had live content on screen. That split answered "is the model between
+   * steps?"; the question a user actually asks during a five-minute tool run is
+   * "is anything still happening at all?", and nothing on screen answered it.
    */
-  processingIndicator?: boolean;
-  /**
-   * #646: true while the calm mid-turn hint ("继续中…") should show — the turn has
-   * already produced content and is in a step-to-step lull (a tool settled / a
-   * step's text finished) with nothing streaming while the model works on the next
-   * step. Deliberately quieter than the first-token indicator so it never reads as
-   * the live thinking being swallowed.
-   */
-  continuingIndicator?: boolean;
+  runningStatus?: boolean;
   activeSession?: SessionSummary;
   /** Durable Deep Research projection supplied by the host for visible progress and resume state. */
   deepResearchRun?: DeepResearchClientProgress;
@@ -204,22 +199,30 @@ export function ChatView(props: {
    * reconciliation on the hot streaming path.
    */
   onReadAttachmentBytes?: ReadAttachmentBytes;
+  /**
+   * Open a linked subagent child session in the main chat column (option A).
+   * Threaded into SubagentPreview / AgentSwarmPreview inside tool detail.
+   * Pass an identity-stable reference so memoized TurnViews keep skipping
+   * reconciliation on the hot streaming path (ChatView also ref-wraps this).
+   */
+  onOpenLinkedSession?(sessionId: string): void;
   onNew(): void;
   onPromptSuggestion?(prompt: string): void;
   /**
    * Codex/Cursor-style "quote this": when set, selecting text in the transcript
    * surfaces a floating action that hands the excerpt (+ its turn) to the host,
    * which stages it as a quote chip on the composer. Omitted by hosts that
-   * don't compose quotes.
+   * don't compose quotes. Only selections that resolve to a turn are offered,
+   * so `turnId` always arrives.
    */
-  onQuoteSelection?(input: { text: string; turnId?: string }): void;
+  onQuoteSelection?(input: { text: string; turnId: string }): void;
   /**
    * Codex/Cursor-style "ask in side panel": when set, selecting text in the
    * transcript surfaces a second floating action that hands the excerpt (+ its
    * turn) to the desktop app, which opens a read-only companion side panel
    * seeded with the quote. Omitted by hosts that don't support the side panel.
    */
-  onAskAboutSelection?(input: { text: string; turnId?: string }): void;
+  onAskAboutSelection?(input: { text: string; turnId: string }): void;
 }) {
   const conversationCopy = getConversationCopy(useUiLocale());
   const copy = conversationCopy.chat;
@@ -285,8 +288,7 @@ export function ChatView(props: {
   // streaming, but delayed flags can lag one frame past complete; terminal
   // evidence must outrank them so copy/regenerate stay actionable.
   const liveInFlight = !!(props.liveTurn && !props.liveTurn.terminal);
-  const waitIndicators = !!(props.processingIndicator || props.continuingIndicator);
-  const streamingActive = liveInFlight || (!props.liveTurn?.terminal && waitIndicators);
+  const streamingActive = liveInFlight || (!props.liveTurn?.terminal && !!props.runningStatus);
   const tailTurnId = liveInFlight
     ? props.liveTurn!.turnId
     : (streamingActive ? turns[turns.length - 1]?.turnId : undefined);
@@ -353,6 +355,12 @@ export function ChatView(props: {
   onLineageBadgeClickRef.current = props.onLineageBadgeClick;
   const stableLineageBadgeClick = useCallback(
     (targetTurnId: string) => onLineageBadgeClickRef.current?.(targetTurnId),
+    [],
+  );
+  const onOpenLinkedSessionRef = useRef(props.onOpenLinkedSession);
+  onOpenLinkedSessionRef.current = props.onOpenLinkedSession;
+  const stableOpenLinkedSession = useCallback(
+    (sessionId: string) => onOpenLinkedSessionRef.current?.(sessionId),
     [],
   );
   const conversationItemsByTurn = useMemo(() => {
@@ -631,13 +639,15 @@ export function ChatView(props: {
                       lineageBadges={turnPresentation?.lineageBadgesByTurn[turn.turnId]}
                       onLineageBadgeClick={stableLineageBadgeClick}
                       onReadAttachmentBytes={props.onReadAttachmentBytes}
+                      onOpenLinkedSession={
+                        props.onOpenLinkedSession ? stableOpenLinkedSession : undefined
+                      }
                       searchHighlighted={highlightedTurnId === turn.turnId}
                       liveStreaming={
                         turn.turnId === tailTurnId
                           ? {
                               onStreamingSettled: props.onStreamingSettled,
-                              processingIndicator: props.processingIndicator,
-                              continuingIndicator: props.continuingIndicator,
+                              runningStatus: props.runningStatus,
                               providerRetry: props.liveTurn?.providerRetry,
                             }
                           : undefined
@@ -666,10 +676,9 @@ export function ChatView(props: {
                       {props.liveTurn?.providerRetry ? (
                         <ModelProviderRetryIndicator retry={props.liveTurn.providerRetry} />
                       ) : (
-                        <>
-                          {props.processingIndicator && <ModelProcessingIndicator />}
-                          {props.continuingIndicator && !props.processingIndicator && <ModelContinuingIndicator />}
-                        </>
+                        /* No turn here means no `startedAt`, so this one shows
+                           the working phrase without a clock. */
+                        props.runningStatus && <TurnRunningStatus />
                       )}
                     </div>
                     <div aria-hidden="true" className="maka-live-turn-footer-placeholder" />
@@ -689,6 +698,9 @@ export function ChatView(props: {
               // Keep the live selection alive while clicking an action.
               onMouseDown={(event) => event.preventDefault()}
             >
+              {/* No icons: the labels already name the actions, so an icon
+                  beside each one encodes the same thing twice and buys the
+                  width back from the text the layer is covering. */}
               <ButtonGroup
                 label={selectionActionsLabel}
                 size="sm"
@@ -698,11 +710,10 @@ export function ChatView(props: {
                   <Button
                     type="button"
                     label={copy.quoteSelection}
-                    icon={<TextQuote aria-hidden="true" />}
                     onClick={() => {
                       props.onQuoteSelection?.({
                         text: selectionQuote.text,
-                        ...(selectionQuote.turnId ? { turnId: selectionQuote.turnId } : {}),
+                        turnId: selectionQuote.turnId,
                       });
                       clearSelectionQuote();
                       window.getSelection()?.removeAllRanges();
@@ -713,11 +724,10 @@ export function ChatView(props: {
                   <Button
                     type="button"
                     label={copy.askInSidePanel}
-                    icon={<TextQuote aria-hidden="true" />}
                     onClick={() => {
                       props.onAskAboutSelection?.({
                         text: selectionQuote.text,
-                        ...(selectionQuote.turnId ? { turnId: selectionQuote.turnId } : {}),
+                        turnId: selectionQuote.turnId,
                       });
                       clearSelectionQuote();
                       window.getSelection()?.removeAllRanges();
@@ -727,8 +737,8 @@ export function ChatView(props: {
               </ButtonGroup>
             </div>,
             {
-              x: selectionQuote.rect.left + selectionQuote.rect.width / 2,
-              y: Math.max(8, selectionQuote.rect.top - 42),
+              x: selectionQuote.anchor.x,
+              y: Math.max(8, selectionQuote.anchor.y - 42),
               style: { transform: 'translateX(-50%)' },
             },
           )

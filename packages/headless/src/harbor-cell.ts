@@ -10,13 +10,19 @@ import type {
   ProviderType,
   RuntimeEvent,
 } from '@maka/core';
-import { isTerminalRuntimeEvent, isThinkingLevel, resolveModelVisionSupport } from '@maka/core';
+import {
+  relayModelProfile,
+  isTerminalRuntimeEvent,
+  isThinkingLevel,
+  resolveModelVisionSupport,
+} from '@maka/core';
 import {
   AgentGraphCoordinator,
   AGENT_TOOL_GROUP_ID,
   AiSdkBackend,
   BackendRegistry,
   PiAgentBackend,
+  SessionActivityRegistry,
   SessionManager,
   buildChildAgentTools,
   buildProviderOptions,
@@ -72,7 +78,10 @@ import {
   buildHeadlessProductToolSurfaceForBackend,
   buildIsolatedHeadlessSupplementalTools,
 } from './tools.js';
-import { createHeadlessSessionCapabilityBridge } from './session-capabilities.js';
+import {
+  createHeadlessAgentGraphWakeCoordinator,
+  createHeadlessSessionCapabilityBridge,
+} from './session-capabilities.js';
 import { resolveHeadlessSystemPrompt } from './system-prompts.js';
 import {
   createInMemoryTaskLedgerExperimentStore,
@@ -148,6 +157,14 @@ export interface RunHarborCellInput {
   continuationPolicy?: HarborCellContinuationPolicy;
   taskToolSummaryEnabled?: boolean;
   settleAfterMs?: number;
+  /**
+   * Deterministic trigger for the same settlement the settleAfterMs timer
+   * arms. A wall-clock budget cannot encode an ordering guarantee, so a test
+   * about "deadline fires before/after completion" resolves this promise at
+   * the exact point in the run it means, instead of hoping a fixed number of
+   * milliseconds lands on the right side of the race (#2221).
+   */
+  settleSignal?: Promise<void>;
   now?: () => number;
   newId?: () => string;
   /** Resume one already-materialized session instead of creating a fresh session. */
@@ -417,6 +434,8 @@ export async function runHarborCellWithStorage(
       { initialBoundary: { kind: 'external', revision: 0 } },
     ));
   const graphControlStore = createAgentGraphControlStore(input.storageRoot);
+  const graphWakeActivities = new SessionActivityRegistry();
+  let graphWakeCoordinator: import('@maka/runtime').AgentGraphSupervisorWakeCoordinator | undefined;
   const graphCoordinator = new AgentGraphCoordinator({
     sessionStore,
     runStore: agentRunStore,
@@ -425,24 +444,43 @@ export async function runHarborCellWithStorage(
     runtime: manager,
     newId,
     rootSessionId: session.id,
+    onReconciliation: (rootSessionId, result) => {
+      graphWakeCoordinator?.notify(rootSessionId, result);
+    },
+    onCheckpoint: (rootSessionId) => {
+      graphWakeCoordinator?.notify(rootSessionId);
+    },
   });
-  sessionCapabilities.bind(manager, graphCoordinator);
+  graphWakeCoordinator = createHeadlessAgentGraphWakeCoordinator({
+    manager,
+    graphCoordinator,
+    activityRegistry: graphWakeActivities,
+    wakeStore: graphControlStore,
+    runStore: agentRunStore,
+    sessionStore,
+    newId,
+  });
+  sessionCapabilities.bind(manager, graphCoordinator, graphWakeCoordinator);
   let deadlineReached = false;
   let settlementError: unknown;
   let settlementAttempt: Promise<void> | undefined;
+  let settlementClosed = false;
+  const armDeadlineSettlement = () => {
+    if (settlementClosed || deadlineReached) return;
+    deadlineReached = true;
+    settlementAttempt = sessionCapabilities
+      .settle(session.id, {
+        source: 'benchmark_deadline',
+      })
+      .catch((error) => {
+        settlementError = error;
+      });
+  };
   const settlementTimer =
     input.settleAfterMs === undefined
       ? undefined
-      : setTimeout(() => {
-          deadlineReached = true;
-          settlementAttempt = sessionCapabilities
-            .settle(session.id, {
-              source: 'benchmark_deadline',
-            })
-            .catch((error) => {
-              settlementError = error;
-            });
-        }, input.settleAfterMs);
+      : setTimeout(armDeadlineSettlement, input.settleAfterMs);
+  if (input.settleSignal) void input.settleSignal.then(armDeadlineSettlement);
 
   const continuationPolicy = input.continuationPolicy ?? {
     enabled: false,
@@ -464,15 +502,20 @@ export async function runHarborCellWithStorage(
       attemptedTurnId = turnId;
       attemptedRunId = runId;
       invocation = undefined;
-      for await (const _event of manager.sendMessage(
-        session.id,
-        { turnId, text: nextText },
-        {
-          runId,
-          ...(input.onRunStarted ? { onRunStarted: input.onRunStarted } : {}),
-        },
-      )) {
-        // Event consumption drives the externally isolated Harbor run.
+      const rootActivity = graphWakeActivities.reserve(session.id);
+      try {
+        for await (const _event of manager.sendMessage(
+          session.id,
+          { turnId, text: nextText },
+          {
+            runId,
+            ...(input.onRunStarted ? { onRunStarted: input.onRunStarted } : {}),
+          },
+        )) {
+          // Event consumption drives the externally isolated Harbor run.
+        }
+      } finally {
+        rootActivity.release();
       }
       if (!invocation)
         throw new Error('Harbor cell turn finished without a runtime invocation result');
@@ -488,6 +531,7 @@ export async function runHarborCellWithStorage(
     if (isStorageRootAuthorityError(error)) throw error;
     sendMessageError = error;
   } finally {
+    settlementClosed = true;
     if (settlementTimer) clearTimeout(settlementTimer);
     // The agent phase is over here, and grading runs after this process exits.
     // Anything the model left managed — a background build, a PTY it never
@@ -508,9 +552,13 @@ export async function runHarborCellWithStorage(
       }
     } finally {
       try {
-        await graphCoordinator.close();
+        await graphWakeCoordinator.close();
       } finally {
-        graphControlStore.close();
+        try {
+          await graphCoordinator.close();
+        } finally {
+          graphControlStore.close();
+        }
       }
     }
   }
@@ -1189,6 +1237,7 @@ export function buildAiSdkCellBackendRegistration(input: {
           connection.providerType,
           connection.models,
           input.model,
+          relayModelProfile(connection, input.model)?.vision,
         ),
         readAttachmentBytes: createAttachmentByteReader({
           artifactStore,

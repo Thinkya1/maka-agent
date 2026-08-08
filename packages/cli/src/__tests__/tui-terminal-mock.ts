@@ -124,13 +124,35 @@ export function latestPlainLineContaining(output: string, text: string): string 
   return line;
 }
 
-export async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 250;
+// A passing wait returns the moment the predicate turns true, so the budget
+// below only bounds how long a FAILING assertion takes to report. 250ms kept
+// local red runs snappy but lost races on loaded CI runners (#2221: a
+// docs-only PR failed test_workspaces at 262ms); CI pays a bigger budget
+// because a red test there costs one report, while a false red costs every
+// reader a log dive. MAKA_TEST_WAIT_BUDGET_MS overrides both.
+export const WAIT_BUDGET_MS =
+  Number(process.env.MAKA_TEST_WAIT_BUDGET_MS ?? '') || (process.env.CI ? 5_000 : 250);
+
+/** Resolves once the TUI is in raw mode and has painted its first frame, so
+ *  typed input reaches a mounted editor instead of racing runner startup. */
+export async function waitForTuiPaint(terminal: FakeTerminal): Promise<void> {
+  await waitFor(
+    () => terminal.startWriteIndex !== null && terminal.writes.length > terminal.startWriteIndex,
+    'the first TUI paint after raw-mode start',
+  );
+}
+
+export async function waitFor(predicate: () => boolean, description?: string): Promise<void> {
+  const deadline = Date.now() + WAIT_BUDGET_MS;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await delay(5);
   }
-  assert.equal(predicate(), true);
+  assert.equal(
+    predicate(),
+    true,
+    `waited ${WAIT_BUDGET_MS}ms for ${description ?? 'a predicate that never became true'}`,
+  );
 }
 
 function renderTerminalScreen(writes: readonly string[], rows: number): string {
