@@ -13,7 +13,7 @@ import {
   SideNavSection,
   useMediaQuery,
 } from '@astryxdesign/core';
-import { ArrowLeft } from '@maka/ui/icons';
+import { ICON_SIZE, ArrowLeft } from '@maka/ui/icons';
 import type {
   AppSettings,
   ChatDefaultPermissionMode,
@@ -279,7 +279,7 @@ export function SettingsSurface(props: {
                       variant="ghost"
                       label={copy.backToApp}
                       tooltip={copy.backToApp}
-                      icon={<ArrowLeft size={16} aria-hidden="true" />}
+                      icon={<ArrowLeft size={ICON_SIZE.chrome} aria-hidden="true" />}
                       onClick={props.onClose}
                     />
                   : <Button
@@ -287,7 +287,7 @@ export function SettingsSurface(props: {
                       variant="ghost"
                       width="100%"
                       label={copy.backToApp}
-                      icon={<ArrowLeft size={16} aria-hidden="true" />}
+                      icon={<ArrowLeft size={ICON_SIZE.chrome} aria-hidden="true" />}
                       onClick={props.onClose}
                     />
               )}
@@ -298,7 +298,7 @@ export function SettingsSurface(props: {
                     <SideNavItem
                       key={item.id}
                       label={item.label}
-                      icon={<item.Icon size={16} aria-hidden="true" />}
+                      icon={<item.Icon size={ICON_SIZE.chrome} aria-hidden="true" />}
                       isSelected={section === item.id}
                       isDisabled={!item.enabled}
                       ref={section === item.id

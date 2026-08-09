@@ -185,6 +185,19 @@ const DYNAMIC_STYLE_HOOKS = new Set([
  * unused, with no series around it, does not belong here; delete it instead.
  */
 const RESERVED_SCALE_TOKENS = new Set([
+  // Five-rung icon scale meta/control/chrome/empty/plate (Chapter C). The CSS
+  // tokens mirror ICON_SIZE in @maka/ui's icons.tsx for the CSS-clamped
+  // sites; a rung with no clamp today (empty, plate) still names its gap.
+  // --icon-size is the deprecated alias, kept one release.
+  '--icon-empty',
+  '--icon-plate',
+  '--icon-size',
+  // Ink tint band --foreground-alpha-10/-16 (visual system 2.0). The 10 rung
+  // lost its last consumer when quote-chip hover converged onto
+  // --state-hover-bg (T5-B); the band only reads as a band with both rungs,
+  // and decorative tints must come from it rather than fresh hand-mixed
+  // alphas (DESIGN.md §3).
+  '--foreground-alpha-10',
   // z-index scale — --z-titlebar (40) and --z-overlay (300) are live; the
   // layering only reads as a scale with the rungs between them present.
   '--z-base',
@@ -193,6 +206,36 @@ const RESERVED_SCALE_TOKENS = new Set([
   '--z-dropdown',
   '--z-tooltip',
   '--z-modal',
+  // Surface ladder sunken/base/raised/overlay (visual system 2.0 T1). The
+  // sunken rung's consumer is the sidebar, which recedes to it in T2; the
+  // ladder only reads as a ladder with its bottom rung present, and defining
+  // the scale is precisely what T1 is for.
+  '--surface-sunken',
+  // Border strength tiers soft/structural/strong (visual system 2.0 T1). The
+  // soft tier's consumers are the sidebar rail and the card edge, which
+  // converge on it in T2-T4; T1 defines the scale without touching product CSS.
+  '--border-soft',
+  // Elevation tiers raised/overlay/drag (visual system 2.0 T1) -- product
+  // names for the theme's shadow scale; consumers adopt them in T2-T4.
+  '--elevation-raised',
+  '--elevation-overlay',
+  '--elevation-drag',
+  // Tinted status surfaces (visual system 2.0 T4). Four statuses x fill/border,
+  // plus a reserved strong tier. These rungs are unconsumed TODAY only because
+  // no current banner happens to be that status at that weight -- and a family
+  // with holes in it is the failure this family exists to end: fourteen call
+  // sites each hand-rolled an alpha precisely because there was no complete set
+  // to consume. A half-defined family sends the next author back to writing
+  // `oklch(from var(--info) l c h / 0.07)`, and it breaks the regeneration
+  // guarantee, since a status recolour can only flow through members that
+  // exist. The strong tier is deliberately reserved rather than convenient:
+  // DESIGN.md restricts it to data-destruction and irreversible warnings.
+  '--success-wash-border',
+  '--info-wash',
+  '--info-wash-border',
+  '--destructive-wash-border',
+  '--destructive-wash-strong',
+  '--destructive-wash-strong-border',
   // Control-height scale, 20/24/28/32/36/40 on the 4px ruler.
   '--h-control-xl',
   '--h-control-2xl',

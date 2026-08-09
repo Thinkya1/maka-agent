@@ -6,7 +6,7 @@ export type UsageSettingsCopy = {
   totalTokens: string; tokenDetail(input: number, output: number): string; cacheTokens: string; cacheDetail(miss: number, read: number, creation: number): string;
   viewAria: string; tabs: readonly [string, string, string, string, string]; filtersAria: string; filterPlaceholder: string; filterAria: string;
   statusAria: string; statuses: readonly [string, string, string]; details: string; detailsAria: string; recordCount(count: number): string; clearFilters: string;
-  summaryOnly: string; showDetails: string; filteredEmpty: string; requestEmpty: string;
+  summaryOnly: string; showDetails: string; filteredEmpty: string; filteredEmptyHelp: string; requestEmpty: string;
   pricing: {
     title: string; description: string; add: string; customize: string; edit: string; remove: string; reset: string;
     save: string; cancel: string; saving: string; removing: string; formAria: string;
@@ -38,7 +38,7 @@ const SETTINGS_USAGE_COPY = {
     filtersAria: '请求记录筛选', filterPlaceholder: '按模型或工具筛选…', filterAria: '按模型或工具筛选请求记录', statusAria: '请求状态筛选',
     statuses: ['全部状态', '成功', '错误'], details: '详情记录', detailsAria: '显示使用统计详情记录', recordCount: (count) => `共 ${count} 条记录`, clearFilters: '清除筛选',
     summaryOnly: '当前仅显示汇总指标。打开详情记录后，可以查看逐条模型请求和工具调用，按模型、工具或状态筛选，并用于排查费用与失败请求。',
-    showDetails: '显示明细', filteredEmpty: '没有符合筛选条件的请求记录', requestEmpty: '暂无请求记录',
+    showDetails: '显示明细', filteredEmpty: '没有符合筛选条件的请求记录', filteredEmptyHelp: '调整或清除筛选条件后可查看全部请求记录。', requestEmpty: '暂无请求记录',
     pricing: {
       title: '自定义定价覆盖',
       description: '为特定模型设置输入、输出和缓存价格；未覆盖的模型继续使用内置定价。',
@@ -76,7 +76,7 @@ const SETTINGS_USAGE_COPY = {
     filtersAria: 'Request filters', filterPlaceholder: 'Filter by model or tool…', filterAria: 'Filter requests by model or tool', statusAria: 'Filter by request status',
     statuses: ['All statuses', 'Success', 'Error'], details: 'Detailed records', detailsAria: 'Show detailed usage records', recordCount: (count) => `${count} ${count === 1 ? 'record' : 'records'}`, clearFilters: 'Clear filters',
     summaryOnly: 'Only summary metrics are shown. Enable detailed records to inspect individual model requests and tool calls, filter by model, tool, or status, and investigate costs or failures.',
-    showDetails: 'Show details', filteredEmpty: 'No requests match these filters', requestEmpty: 'No request records',
+    showDetails: 'Show details', filteredEmpty: 'No requests match these filters', filteredEmptyHelp: 'Adjust or clear the filters to see all request records.', requestEmpty: 'No request records',
     pricing: {
       title: 'Custom pricing overrides',
       description: 'Set input, output, and cache rates for a model; uncovered models continue using built-in pricing.',

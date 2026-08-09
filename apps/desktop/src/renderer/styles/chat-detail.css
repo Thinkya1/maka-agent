@@ -155,6 +155,9 @@
   color: var(--foreground-secondary);
   touch-action: none;
   user-select: none;
+  transition:
+    background var(--duration-quick) var(--ease-out-strong),
+    color var(--duration-quick) var(--ease-out-strong);
 }
 
 .maka-workbar-tab:hover,
@@ -185,8 +188,8 @@
 }
 
 .maka-workbar-tab-icon {
-  width: 14px;
-  height: 14px;
+  width: var(--icon-control);
+  height: var(--icon-control);
   flex: 0 0 auto;
 }
 
@@ -321,8 +324,8 @@
 }
 
 .maka-workbar-launcher-icon > svg {
-  width: 16px;
-  height: 16px;
+  width: var(--icon-chrome);
+  height: var(--icon-chrome);
 }
 
 .maka-workbar-launcher-label {
@@ -1000,6 +1003,13 @@
   background: var(--state-hover-bg);
 }
 
+/* Rows are arrow-key navigable (artifact-list-keyboard.ts); keyboard focus
+   gets the same inset ring the workbar launcher rows use. */
+.maka-artifact-row:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 var(--focus-ring-width) var(--focus-ring);
+}
+
 .maka-artifact-row:active:not([data-deleted="true"]) {
   background: var(--state-selected-bg);
 }
@@ -1172,7 +1182,9 @@
   height: 100%;
   border: var(--border-width-hairline) solid var(--border);
   border-radius: var(--radius-surface);
-  background: white;
+  /* Paper, not a ladder tier — see --surface-paper in maka-tokens.css. The
+     srcDoc we render declares no background of its own. */
+  background: var(--surface-paper);
   /* iframe sandbox attribute on the JSX side carries the real boundary;
      this is only visual. NEVER ship `allow-same-origin` here. */
 }
@@ -1271,7 +1283,8 @@
 .maka-artifact-preview-pdf embed {
   border: var(--border-width-hairline) solid var(--border);
   border-radius: var(--radius-surface);
-  background: white;
+  /* Same document viewport as the HTML artifact above. */
+  background: var(--surface-paper);
   min-height: 240px;
 }
 
@@ -1373,11 +1386,19 @@
  * This styles the `.maka-turn` container (NOT a per-turn marker), so it
  * stays hand-written here alongside the other model-catalog-preview turn
  * chrome. */
+/* Visual System 2.0 (T3): derived from `--accent`, not `--link`. Zero pixels
+ * move — `--link` is defined exactly twice and both are `var(--accent)`, and
+ * palettes override --accent alone — but the two names mean different things.
+ * DESIGN.md §3 scopes the link tier to link TEXT (and to `--accent-solid` at
+ * that, for contrast); this is a selection wash and an outline, i.e. the
+ * interaction accent doing its normal job. Deriving a surface from the link
+ * name is how a text-contrast constraint ends up silently governing a
+ * background. */
 .maka-turn[data-search-highlight="true"] {
   border-radius: var(--radius-surface);
-  outline: 1px solid oklch(from var(--link) l c h / 0.34);
+  outline: 1px solid oklch(from var(--accent) l c h / 0.34);
   outline-offset: 6px;
-  background: oklch(from var(--link) l c h / 0.045);
+  background: oklch(from var(--accent) l c h / 0.045);
 }
 
 /* Turn aborted marker / failed banner / lineage rows + badges / footer +

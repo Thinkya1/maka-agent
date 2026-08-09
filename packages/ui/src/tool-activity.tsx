@@ -6,6 +6,7 @@ import {
   type UiLocale,
 } from '@maka/core';
 import {
+  ICON_SIZE,
   Check,
   Clock,
   Copy,
@@ -100,7 +101,7 @@ function AutomationResultPreview(props: { text: string }) {
     return (
       <div className={previewVariants({ part: 'load-tool' })} data-kind="automation_create">
         <p className={previewVariants({ part: 'load-tool-title' })}>
-          <Icon size={14} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
+          <Icon size={ICON_SIZE.control} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
           {copy.created(redactSecrets(created[1] ?? ''))}
         </p>
         {schedule && <p className={previewVariants({ part: 'load-tool-count' })}>{redactSecrets(schedule)}</p>}
@@ -117,7 +118,7 @@ function AutomationResultPreview(props: { text: string }) {
     return (
       <div className={previewVariants({ part: 'load-tool' })} data-kind="automation_delete">
         <p className={previewVariants({ part: 'load-tool-title' })}>
-          <Check size={14} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
+          <Check size={ICON_SIZE.control} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
           {ok ? copy.deleted : copy.notFound}
         </p>
       </div>
@@ -131,7 +132,7 @@ function AutomationResultPreview(props: { text: string }) {
     return (
       <div className={previewVariants({ part: 'load-tool' })} data-kind="automation_list">
         <p className={previewVariants({ part: 'load-tool-title' })}>
-          <Clock size={14} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
+          <Clock size={ICON_SIZE.control} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
           {copy.list(blocks.length)}
         </p>
         {blocks.length === 0 && <p className={previewVariants({ part: 'load-tool-count' })}>{copy.empty}</p>}
@@ -140,7 +141,7 @@ function AutomationResultPreview(props: { text: string }) {
           const BlockIcon = automationScheduleIcon(block);
           return (
             <p key={i} className={previewVariants({ part: 'load-tool-tools' })}>
-              <BlockIcon size={12} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
+              <BlockIcon size={ICON_SIZE.meta} aria-hidden="true" className={AUTOMATION_RESULT_ICON_CLASS} />
               {redactSecrets(head)}
             </p>
           );
@@ -303,18 +304,21 @@ export function ToolTrow({
 }) {
   const locale = useUiLocale();
   if (items.length === 0) return null;
-  const calls = items.flatMap((item) => linkedAgentCalls(item, locale, onOpenLinkedSession)
+  const calls = items.flatMap((item) => linkedAgentCalls(item, locale)
     ?? [standardToolCall(item, locale)]);
+  const openers = items.flatMap((item) => linkedSessionOpeners(item, locale, onOpenLinkedSession));
 
-  // No defaultIsExpanded: opening a group is the reader's move. Seeding it open
-  // from in-flight status latches, since the prop is uncontrolled and the
-  // timeline key is stable (see timelineEntryKey). Cost: the collapsed header
-  // projects the last call, which can settle before a parallel sibling.
-  //
-  // A group's own +/- is the whole turn's, not the last call's: a run of five
-  // Edits collapses to one line, and "what did this turn change" is the
-  // question that line has to answer. Per-call counts stay on the rows inside.
-  return <ChatToolCalls calls={calls} {...diffStats(items.flatMap(itemDiffs))} />;
+  // Stock ChatToolCalls only. Linked child sessions open via Astryx Button
+  // beside the row — no vendor onActivate patch.
+  return (
+    <>
+      <ChatToolCalls
+        className="maka-tool-activity-card"
+        calls={calls}
+      />
+      {openers}
+    </>
+  );
 }
 
 function standardToolCall(item: ToolActivityItem, locale: UiLocale): ChatToolCallItem {
@@ -342,12 +346,10 @@ function standardToolCall(item: ToolActivityItem, locale: UiLocale): ChatToolCal
 function linkedAgentCalls(
   item: ToolActivityItem,
   locale: UiLocale,
-  onOpenLinkedSession: ((sessionId: string) => void) | undefined,
 ): ChatToolCallItem[] | undefined {
   const result = item.result;
   if (result?.kind === 'subagent') {
     const name = redactSecrets(result.agentName.trim()) || resolveToolDisplayName(item, locale);
-    const open = linkedSessionActivation(result.childSessionId, name, locale, onOpenLinkedSession);
     return [{
       key: item.toolUseId,
       name,
@@ -360,7 +362,6 @@ function linkedAgentCalls(
         ? redactSecrets(result.failureClass)
         : toolCallErrorMessage(item, locale),
       stats: subagentStats(result.status, result.permissionMode === 'explore', locale),
-      ...open,
     }];
   }
   if (result?.kind !== 'agent_swarm') return undefined;
@@ -375,7 +376,6 @@ function linkedAgentCalls(
       duration: formatDuration(child.durationMs) ?? undefined,
       errorMessage: child.failureClass ? redactSecrets(child.failureClass) : undefined,
       stats: subagentStats(child.status, child.profile === 'local_read', locale),
-      ...linkedSessionActivation(child.childSessionId, name, locale, onOpenLinkedSession),
     } satisfies ChatToolCallItem;
   });
 }
@@ -400,17 +400,41 @@ function subagentStats(
     .join(' · ');
 }
 
-function linkedSessionActivation(
-  childSessionId: string | undefined,
-  name: string,
+function linkedSessionOpeners(
+  item: ToolActivityItem,
   locale: UiLocale,
   onOpenLinkedSession: ((sessionId: string) => void) | undefined,
-): Pick<ChatToolCallItem, 'onActivate' | 'activateLabel'> {
-  if (!childSessionId || !onOpenLinkedSession) return {};
-  return {
-    onActivate: () => onOpenLinkedSession(childSessionId),
-    activateLabel: getToolActivityCopy(locale).agent.openSessionAriaLabel(name),
-  };
+) {
+  if (!onOpenLinkedSession) return [];
+  const result = item.result;
+  if (result?.kind === 'subagent') {
+    if (!result.childSessionId) return [];
+    const name = redactSecrets(result.agentName.trim()) || resolveToolDisplayName(item, locale);
+    return [linkedSessionButton(result.childSessionId, name, locale, onOpenLinkedSession)];
+  }
+  if (result?.kind !== 'agent_swarm') return [];
+  return result.items.flatMap((child) => {
+    if (!child.childSessionId) return [];
+    const name = redactSecrets((child.agentName || child.itemId).trim()) || child.profile;
+    return [linkedSessionButton(child.childSessionId, name, locale, onOpenLinkedSession)];
+  });
+}
+
+function linkedSessionButton(
+  childSessionId: string,
+  name: string,
+  locale: UiLocale,
+  onOpenLinkedSession: (sessionId: string) => void,
+) {
+  const label = getToolActivityCopy(locale).agent.openSessionAriaLabel(name);
+  return (
+    <UiButton
+      key={childSessionId}
+      variant="secondary"
+      label={label}
+      onClick={() => onOpenLinkedSession(childSessionId)}
+    />
+  );
 }
 
 function boundedAgentSummary(summary: string): string | undefined {
@@ -555,7 +579,7 @@ function SandboxBlockedBanner(props: {
     <Banner
       status="warning"
       className="maka-sandbox-blocked-banner"
-      icon={<ShieldAlert size={16} aria-hidden="true" />}
+      icon={<ShieldAlert size={ICON_SIZE.chrome} aria-hidden="true" />}
       title={bannerCopy.title}
       description={(
         <span className="maka-sandbox-blocked-description">
@@ -578,7 +602,7 @@ function SandboxBlockedBanner(props: {
           aria-busy={copyPending ? 'true' : undefined}
           isDisabled={copyPending}
           onClick={() => void copy()}
-          icon={copyPhase === 'copied' ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+          icon={copyPhase === 'copied' ? <Check size={ICON_SIZE.control} aria-hidden="true" /> : <Copy size={ICON_SIZE.control} aria-hidden="true" />}
           label={copyLabel}
         />
       ) : undefined}

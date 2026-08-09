@@ -140,6 +140,23 @@ describe('subagent tools', () => {
     });
   });
 
+  test('agent_spawn names both recovery routes when no child selector is provided', () => {
+    const schema = buildSubagentSpawnTool({
+      definitions: [LOCAL_READ_AGENT_DEFINITION, WEB_RESEARCH_AGENT_DEFINITION],
+    }).parameters as {
+      safeParse(input: unknown): {
+        success: boolean;
+        error?: { issues: Array<{ message: string }> };
+      };
+    };
+
+    const parsed = schema.safeParse({ task: 'Inspect the repo.' });
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.issues.map((issue) => issue.message)).toContain(
+      'No child selector was provided. Call agent_list and pass a returned subagent_id to agent_spawn, or pass one legacy profile: local_read, web_research.',
+    );
+  });
+
   test('built-in catalog exposes local-read without shell, web, nested, or write tools', () => {
     expect(LOCAL_READ_AGENT_DEFINITION.id).toBe(LOCAL_READ_AGENT_ID);
     expect(LOCAL_READ_AGENT_DEFINITION.profile).toBe(LOCAL_READ_AGENT_PROFILE);
@@ -264,19 +281,14 @@ describe('subagent tools', () => {
       'Write',
       'Edit',
       'Bash',
+      'WriteStdin',
+      'StopBackgroundTask',
     ]);
     expect(IMPLEMENTATION_AGENT_DEFINITION.tools.includes('WebSearch')).toBe(false);
     expect(IMPLEMENTATION_AGENT_DEFINITION.tools.includes('ExploreAgent')).toBe(false);
 
     const availability = listBuiltinAgentDefinitions({
-      tools: [
-        testCatalogTool('Read', 'read'),
-        testCatalogTool('Glob', 'read'),
-        testCatalogTool('Grep', 'read'),
-        testCatalogTool('Write', 'file_write'),
-        testCatalogTool('Edit', 'file_write'),
-        testCatalogTool('Bash', 'shell_unsafe'),
-      ],
+      tools: implementationCatalogTools(),
     }).find((definition) => definition.id === IMPLEMENTATION_AGENT_ID)?.availability;
     expect(availability).toEqual({
       status: 'unavailable',
@@ -289,14 +301,7 @@ describe('subagent tools', () => {
       Promise.resolve().then(() =>
         assertAgentDefinitionRunnable({
           definition: IMPLEMENTATION_AGENT_DEFINITION,
-          tools: [
-            testCatalogTool('Read', 'read'),
-            testCatalogTool('Glob', 'read'),
-            testCatalogTool('Grep', 'read'),
-            testCatalogTool('Write', 'file_write'),
-            testCatalogTool('Edit', 'file_write'),
-            testCatalogTool('Bash', 'shell_unsafe'),
-          ],
+          tools: implementationCatalogTools(),
         }),
       ),
       /worktree child executor/,
@@ -304,27 +309,13 @@ describe('subagent tools', () => {
 
     const runnableAvailability = listBuiltinAgentDefinitions({
       worktreeChildExecutorAvailable: true,
-      tools: [
-        testCatalogTool('Read', 'read'),
-        testCatalogTool('Glob', 'read'),
-        testCatalogTool('Grep', 'read'),
-        testCatalogTool('Write', 'file_write'),
-        testCatalogTool('Edit', 'file_write'),
-        testCatalogTool('Bash', 'shell_unsafe'),
-      ],
+      tools: implementationCatalogTools(),
     }).find((definition) => definition.id === IMPLEMENTATION_AGENT_ID)?.availability;
     expect(runnableAvailability).toEqual({ status: 'available' });
     assertAgentDefinitionRunnable({
       worktreeChildExecutorAvailable: true,
       definition: IMPLEMENTATION_AGENT_DEFINITION,
-      tools: [
-        testCatalogTool('Read', 'read'),
-        testCatalogTool('Glob', 'read'),
-        testCatalogTool('Grep', 'read'),
-        testCatalogTool('Write', 'file_write'),
-        testCatalogTool('Edit', 'file_write'),
-        testCatalogTool('Bash', 'shell_unsafe'),
-      ],
+      tools: implementationCatalogTools(),
     });
   });
 
@@ -408,6 +399,8 @@ describe('subagent tools', () => {
   test('child agent toolset keeps only built-in profile allowlisted tools', () => {
     const tools = buildChildAgentTools([
       ...buildBuiltinTools(),
+      testCatalogTool('WriteStdin', 'shell_unsafe'),
+      testCatalogTool('StopBackgroundTask', 'shell_unsafe'),
       {
         name: AGENT_SPAWN_TOOL_NAME,
         description: 'spawn',
@@ -439,6 +432,8 @@ describe('subagent tools', () => {
       'Write',
       'Edit',
       'Bash',
+      'WriteStdin',
+      'StopBackgroundTask',
     ]);
     expect([...CHILD_AGENT_TOOL_NAMES]).toEqual([
       'Read',
@@ -448,6 +443,8 @@ describe('subagent tools', () => {
       'Write',
       'Edit',
       'Bash',
+      'WriteStdin',
+      'StopBackgroundTask',
     ]);
   });
 
@@ -1202,6 +1199,7 @@ describe('subagent tools', () => {
       ],
       legacy_profiles: [
         {
+          agent_id: LOCAL_READ_AGENT_ID,
           profile: LOCAL_READ_AGENT_PROFILE,
           name: 'Local Read',
           description: 'Read-only repository exploration.',
@@ -1247,6 +1245,7 @@ describe('subagent tools', () => {
     const catalog = {
       definitions: [
         {
+          id: LOCAL_READ_AGENT_ID,
           profile: LOCAL_READ_AGENT_PROFILE,
           name: 'Local Read',
           description: 'Read-only repository exploration.',
@@ -1451,6 +1450,10 @@ function testCatalogTool(name: string, categoryHint: MakaTool['categoryHint']): 
     categoryHint,
     impl: async () => ({}),
   };
+}
+
+function implementationCatalogTools(): MakaTool[] {
+  return IMPLEMENTATION_AGENT_DEFINITION.tools.map((name) => testCatalogTool(name, undefined));
 }
 
 async function expectRejects(promise: Promise<unknown>, pattern: RegExp): Promise<void> {

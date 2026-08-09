@@ -36,6 +36,7 @@ import {
   LocaleProvider,
   ModuleHubSelector,
   ToastProvider,
+  type ToastErrorAction,
   type NavSelection,
   SessionListPanel,
   SkillsPage,
@@ -70,7 +71,6 @@ import {
   findPreferredSideChatWorkbarTab,
   terminalRefFromWorkbarTab,
   terminalSessionWorkbarTabId,
-  staticSessionWorkbarTabId,
 } from './session-workbar-tabs';
 import {
   consumeCompanionInitialPrompt,
@@ -180,7 +180,6 @@ import { useShellChatModel } from './use-shell-chat-model';
 import { useShellLiveTurn } from './use-shell-live-turn';
 import { useShellLayout } from './use-shell-layout';
 import { useShellResume } from './use-shell-resume';
-import { filterUserVisibleArtifacts } from './artifact-visibility';
 import { recoverOrphanedCompanionCopies } from './quote-companion-core';
 import { useSideConversationWorkspace } from './use-side-conversation-workspace';
 
@@ -236,6 +235,22 @@ export function AppShell({ initialOnboardingSnapshot = null }: AppShellProps = {
   const [uiLocaleOverride, setUiLocaleOverride] = useState<UiLocale | null>(null);
   const systemUiLocale = useSystemUiLocale();
   const uiLocale = resolveUiLocale(uiLocalePreference, systemUiLocale, uiLocaleOverride);
+  const errorToastAction = useMemo<ToastErrorAction>(
+    () => ({
+      label: getShellCopy(uiLocale).errorBoundary.copyReport,
+      onClick: (input) => {
+        void window.maka.diagnostics.copyErrorReport({
+            surface: 'toast',
+            title: input.title,
+            ...(input.description ? { description: input.description } : {}),
+            rendererUserAgent: navigator.userAgent,
+            rendererLocale: navigator.language,
+          })
+          .catch(() => undefined);
+      },
+    }),
+    [uiLocale],
+  );
 
   return (
     <LocaleProvider locale={uiLocale} override={uiLocaleOverride}>
@@ -244,7 +259,7 @@ export function AppShell({ initialOnboardingSnapshot = null }: AppShellProps = {
           `useUiLocale()` throws before anything renders. Still above every
           Astryx subtree. */}
       <AstryxLocaleProvider>
-        <ToastProvider>
+        <ToastProvider errorAction={errorToastAction}>
           <ErrorBoundary locale={uiLocale}>
             <AppShellContent
               initialOnboardingSnapshot={initialOnboardingSnapshot}
@@ -1307,9 +1322,6 @@ function AppShellContent({
     pinWorkbarTab,
     openWorkbarLauncher,
   } = useShellLayout();
-  const workbarPanelsStateRef = useRef(workbarPanelsState);
-  workbarPanelsStateRef.current = workbarPanelsState;
-
   const revealWorkbarLauncher = useCallback(() => {
     setWorkbarCollapsed(false);
     openWorkbarLauncher('right');
@@ -1372,55 +1384,6 @@ function AppShellContent({
         : [],
     [activeId, workbarCopy],
   );
-  useEffect(() => {
-    return window.maka.artifacts.subscribeChanges((event) => {
-      if (
-        event.reason !== 'created' ||
-        event.sessionId !== activeIdRef.current ||
-        navSelectionRef.current.section !== 'sessions'
-      ) {
-        return;
-      }
-      const expectedSessionId = event.sessionId;
-      void window.maka.artifacts
-        .get(expectedSessionId, event.artifactId)
-        .then((artifact) => {
-          if (
-            !artifact ||
-            activeIdRef.current !== expectedSessionId ||
-            navSelectionRef.current.section !== 'sessions' ||
-            filterUserVisibleArtifacts([artifact]).length === 0
-          ) {
-            return;
-          }
-          const filesTabId = staticSessionWorkbarTabId('files');
-          const current = workbarPanelsStateRef.current;
-          const placement = current.right.tabs.some(
-            (tab) => tab.id === filesTabId,
-          )
-            ? 'right'
-            : current.bottom.tabs.some((tab) => tab.id === filesTabId)
-              ? 'bottom'
-              : 'right';
-          openDynamicWorkbarTab(
-            {
-              id: filesTabId,
-              kind: 'files',
-              preview: true,
-            },
-            placement,
-          );
-          if (placement === 'right') setWorkbarCollapsed(false);
-          else setBottomPanelOpen(true);
-        })
-        .catch(() => {});
-    });
-  }, [
-    openDynamicWorkbarTab,
-    setBottomPanelOpen,
-    setWorkbarCollapsed,
-  ]);
-
   const openSideConversationWithQuote = useCallback(
     (quote: QuoteRef) => {
       if (!activeId) return;
@@ -2668,13 +2631,8 @@ function AppShellContent({
                 />
               ) : null}
               <ChatSurfaceLayout
-                // #2205: Astryx ChatLayout owns the new-message indicator and
-                // the scroll lock, and neither is keyed to a conversation. A
-                // session switch must reset both without remounting the layout —
-                // a remount would drop an in-progress composer draft. Passing
-                // the active session id as conversationKey makes ChatLayout
-                // re-lock the scroll and clear the new-message baseline on every
-                // switch (undefined while no session is selected).
+                // Reset conversation-owned scroll state without remounting the
+                // composer: its contenteditable DOM carries the live draft.
                 conversationKey={activeId}
                 hidden={navSelection.section !== 'sessions'}
                 composer={

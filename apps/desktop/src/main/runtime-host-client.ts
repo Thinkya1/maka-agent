@@ -97,6 +97,7 @@ import {
 } from "@maka/runtime-host/protocol";
 
 const MAX_OPTIMISTIC_ATTEMPTS = 3;
+const MAX_SESSION_REVISION_ATTEMPTS = 8;
 const MAX_PRICING_SNAPSHOT_ATTEMPTS = 3;
 
 export type DesktopSessionConfigurationPatch = Partial<SessionConfiguration>;
@@ -296,6 +297,19 @@ export class DesktopRuntimeHostClient {
     input: OperationInput<"credential.vault.delete">,
   ): Promise<OperationOutput<"credential.vault.delete">> {
     return this.#request("credential.vault.delete", input);
+  }
+
+  getConnectionRequestHeaders(
+    connectionId: string,
+  ): Promise<OperationOutput<"connection.request-headers.query">> {
+    return this.#request("connection.request-headers.query", { connectionId });
+  }
+
+  replaceConnectionRequestHeaders(
+    connectionId: string,
+    headers: OperationInput<"connection.request-headers.replace">["headers"],
+  ): Promise<OperationOutput<"connection.request-headers.replace">> {
+    return this.#request("connection.request-headers.replace", { connectionId, headers });
   }
 
   fetchConnectionModels(
@@ -730,7 +744,7 @@ export class DesktopRuntimeHostClient {
   }
 
   async removeSession(sessionId: string): Promise<void> {
-    for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt += 1) {
+    for (let attempt = 0; attempt < MAX_SESSION_REVISION_ATTEMPTS; attempt += 1) {
       const current = await this.#requireSession(sessionId);
       const result = await this.#request("session.remove", {
         sessionId,
@@ -913,6 +927,10 @@ export class DesktopRuntimeHostClient {
     input: OperationInput<"turn.query">,
   ): Promise<OperationOutput<"turn.query">> {
     return this.#request("turn.query", input);
+  }
+
+  queryHostDiagnostics(): Promise<OperationOutput<"host.diagnostics.query">> {
+    return this.connection.queryHostDiagnostics(2_000);
   }
 
   stopTurn(
@@ -1375,7 +1393,7 @@ export class DesktopRuntimeHostClient {
     sessionId: string,
     update: (current: SessionCatalogProjection) => Promise<SessionUpdateResult>,
   ): Promise<SessionCatalogProjection> {
-    for (let attempt = 0; attempt < MAX_OPTIMISTIC_ATTEMPTS; attempt += 1) {
+    for (let attempt = 0; attempt < MAX_SESSION_REVISION_ATTEMPTS; attempt += 1) {
       const current = await this.#requireSession(sessionId);
       const result = await update(current);
       if (result.kind === "committed")

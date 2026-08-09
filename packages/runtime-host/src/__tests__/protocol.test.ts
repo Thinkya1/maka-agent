@@ -27,8 +27,9 @@ import {
   RUNTIME_POLICY_OPERATION_SPECS,
   RuntimeHostProtocolError,
 } from '../protocol/index.js';
-import { HOST_STATUS_OPERATION_SPECS } from '../protocol/host-status.js';
+import { HOST_BOOTSTRAP_OPERATION_SPECS } from '../protocol/host-status.js';
 import { composeOperationSpecMaps } from '../protocol/operation-spec.js';
+import { runtimeHostLogBuffer } from '../process-diagnostics.js';
 import {
   TURN_MESSAGE_QUOTE_LABEL_MAX_LENGTH,
   TURN_MESSAGE_QUOTE_MAX_COUNT,
@@ -47,7 +48,7 @@ describe('Runtime Host bootstrap protocol', () => {
 
   test('keeps the experimental protocol at v0 with the declared authority operations', () => {
     assert.equal(RUNTIME_HOST_PROTOCOL_VERSION, 0);
-    assert.equal(RUNTIME_HOST_COMPATIBILITY_EPOCH, 8);
+    assert.equal(RUNTIME_HOST_COMPATIBILITY_EPOCH, 10);
     assert.deepEqual(Object.keys(HOST_OPERATION_SPECS).sort(), [
       'agent.graph.operator.query',
       'agent.graph.query',
@@ -68,6 +69,8 @@ describe('Runtime Host bootstrap protocol', () => {
       'connection.models.fetch',
       'connection.onboarding.save',
       'connection.onboarding.verify',
+      'connection.request-headers.query',
+      'connection.request-headers.replace',
       'connection.test.run',
       'context.compact',
       'context.diagnostics.query',
@@ -84,6 +87,7 @@ describe('Runtime Host bootstrap protocol', () => {
       'external-session.source.query',
       'goal.control',
       'goal.query',
+      'host.diagnostics.query',
       'host.status',
       'interaction.answer',
       'interaction.query',
@@ -472,10 +476,11 @@ describe('Runtime Host bootstrap protocol', () => {
     );
   });
 
-  test('declares exactly the ten Runtime Policy operations in the current framework', () => {
+  test('declares exactly the twelve Runtime Policy operations in the current framework', () => {
     const queries = [
       'runtime.policy.query',
       'connection.catalog.query',
+      'connection.request-headers.query',
       'credential.vault.query',
     ] as const;
     const mutations = [
@@ -484,6 +489,7 @@ describe('Runtime Host bootstrap protocol', () => {
       'connection.catalog.update',
       'connection.catalog.remove',
       'connection.catalog.set-default-target',
+      'connection.request-headers.replace',
       'credential.vault.set',
       'credential.vault.delete',
     ] as const;
@@ -507,6 +513,51 @@ describe('Runtime Host bootstrap protocol', () => {
       );
       assert.ok(RUNTIME_POLICY_OPERATION_SPECS[operation].errors.includes('internal_failure'));
     }
+  });
+
+  test('allows larger credential frames only for validated custom request headers', () => {
+    const secret = JSON.stringify(
+      Object.fromEntries(
+        Array.from({ length: 3 }, (_, index) => [`X-${index}`, '"'.repeat(8_192)]),
+      ),
+    );
+    const secretBase64 = Buffer.from(secret, 'utf8').toString('base64');
+    const requestHeadersLocator = {
+      scope: 'connection',
+      connectionId: '00000000-0000-4000-8000-000000000001',
+      kind: 'request_headers',
+    } as const;
+    const apiKeyLocator = { ...requestHeadersLocator, kind: 'api_key' as const };
+    const setCredential = RUNTIME_POLICY_OPERATION_SPECS['credential.vault.set'];
+    const exportCredentials = HOST_OPERATION_SPECS['configuration.credentials.export'];
+
+    assert.doesNotThrow(() =>
+      setCredential.decodeInput({ locator: requestHeadersLocator, expected: null, secret }),
+    );
+    assert.throws(
+      () => setCredential.decodeInput({ locator: apiKeyLocator, expected: null, secret }),
+      isInvalidFrame,
+    );
+    assert.doesNotThrow(() =>
+      exportCredentials.decodeOutput({
+        credential: { locator: requestHeadersLocator, secretBase64 },
+      }),
+    );
+    assert.doesNotThrow(() =>
+      encodeProtocolFrame({
+        requestId: 'credential-export',
+        operation: 'configuration.credentials.export',
+        ok: true,
+        result: { credential: { locator: requestHeadersLocator, secretBase64 } },
+      }),
+    );
+    assert.throws(
+      () =>
+        exportCredentials.decodeOutput({
+          credential: { locator: apiKeyLocator, secretBase64 },
+        }),
+      isInvalidFrame,
+    );
   });
 
   test('keeps Runtime Policy request and response codecs exact', () => {
@@ -1450,12 +1501,40 @@ describe('Runtime Host bootstrap protocol', () => {
 
   test('rejects duplicate operation keys while composing domain registries', () => {
     const composeUnchecked = composeOperationSpecMaps as (
-      left: typeof HOST_STATUS_OPERATION_SPECS,
-      right: typeof HOST_STATUS_OPERATION_SPECS,
+      left: typeof HOST_BOOTSTRAP_OPERATION_SPECS,
+      right: typeof HOST_BOOTSTRAP_OPERATION_SPECS,
     ) => unknown;
     assert.throws(
-      () => composeUnchecked(HOST_STATUS_OPERATION_SPECS, HOST_STATUS_OPERATION_SPECS),
+      () => composeUnchecked(HOST_BOOTSTRAP_OPERATION_SPECS, HOST_BOOTSTRAP_OPERATION_SPECS),
       /Duplicate Runtime Host operation key: host\.status/,
+    );
+  });
+
+  test('keeps Runtime Host logs within the diagnostics operation contract', () => {
+    for (let index = 0; index < 257; index += 1) {
+      runtimeHostLogBuffer.append('info', `entry ${index}`);
+    }
+    runtimeHostLogBuffer.append('error', '🚀'.repeat(3_000));
+    const logs = runtimeHostLogBuffer.snapshot();
+
+    assert.equal(logs.length, 256);
+    assert.doesNotThrow(() =>
+      HOST_BOOTSTRAP_OPERATION_SPECS['host.diagnostics.query'].decodeOutput({
+        hostEpoch: 'epoch-1',
+        state: 'ready',
+        connections: 1,
+        activeOperations: 0,
+        activeResidencies: 0,
+        protocolVersion: 0,
+        compatibilityEpoch: 9,
+        pid: 42,
+        processUptimeSeconds: 1,
+        nodeVersion: '22.0.0',
+        platform: 'linux',
+        arch: 'x64',
+        osRelease: '6.6.0',
+        logs,
+      }),
     );
   });
 
